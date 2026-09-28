@@ -2,9 +2,8 @@ import ast
 import unittest
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
-MODULE = ROOT / 'twf' / 'normal_wife.py'
+MODULE = ROOT / 'TodayWaifu' / 'normal_wife.py'
 
 
 def _load_parser():

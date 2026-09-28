@@ -1,12 +1,11 @@
-import importlib.util
 import sys
 import tempfile
 import unittest
+import importlib.util
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
-MODULE_PATH = ROOT / 'twf' / 'folder_gallery.py'
+MODULE_PATH = ROOT / 'TodayWaifu' / 'folder_gallery.py'
 
 
 def _load_module():

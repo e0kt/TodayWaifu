@@ -1,0 +1,336 @@
+"""战双帕弥什本地图库抽取。"""
+from __future__ import annotations
+
+from .shared import (
+    LOG_PREFIX,
+    UPLOAD_IMAGE_MAX_BYTES,
+    Bot,
+    Path,
+    Event,
+    WifeRecord,
+    RoleCandidate,
+    _cfg,
+    time,
+    logger,
+    random,
+    _cfg_bool,
+    _user_key,
+    _daily_rng,
+    _is_master,
+    _safe_send,
+    _wife_state,
+    pgr_wife_sv,
+    _pgr_wife_root,
+    _record_to_dict,
+    image_upload_sv,
+    specify_wife_sv,
+    _send_role_image,
+    _can_specify_wife,
+    _pick_role_record,
+    _record_from_dict,
+    _send_local_image,
+    _can_upload_images,
+    _daily_bucket_name,
+    _daily_context_lock,
+    _load_daily_context,
+    _save_daily_records,
+    _daily_kind_metadata,
+    _normalize_role_name,
+    _load_pgr_wife_candidates,
+    _get_other_daily_wife_name,
+    _invalidate_candidate_cache,
+)
+from .executor import run_blocking
+from .image_input import image_hash_id, read_image_bytes, collect_image_refs
+from .folder_gallery import find_named_role_directory
+
+
+def _unique_pgr_image_path(role_dir: Path, suffix: str, index: int) -> Path:
+    stamp = int(time.time() * 1000)
+    counter = 0
+    while True:
+        tail = f'_{counter}' if counter else ''
+        path = role_dir / f'pgr_{stamp}_{index}{tail}{suffix}'
+        if not path.exists():
+            return path
+        counter += 1
+
+
+def _save_pgr_image(role_dir: Path, source: str, index: int) -> Path | None:
+    image_data = read_image_bytes(source, UPLOAD_IMAGE_MAX_BYTES)
+    if image_data is None:
+        return None
+    data, suffix = image_data
+    path = _unique_pgr_image_path(role_dir, suffix, index)
+    path.write_bytes(data)
+    return path
+
+
+async def _send_upload_pgr_wife_images(bot: Bot, ev: Event) -> None:
+    if not _can_upload_images(ev):
+        return await _safe_send(bot, '你不在图片上传白名单中。')
+
+    role_name = str(ev.text or '').strip().strip('"“”‘’')
+    if not role_name:
+        return await _safe_send(
+            bot,
+            '请输入已有角色文件夹名称，例如：上传战双老婆图片 露西亚，并附带图片。',
+        )
+
+    role_dir = find_named_role_directory(_pgr_wife_root(), role_name)
+    if role_dir is None:
+        return await _safe_send(
+            bot,
+            f'战双图库中不存在角色文件夹【{role_name}】，请先由主人创建对应文件夹。',
+        )
+
+    image_refs = collect_image_refs(ev)
+    if not image_refs:
+        return await _safe_send(
+            bot,
+            f'请同时发送图片和命令，例如：上传战双老婆图片 {role_dir.name}',
+        )
+
+    saved: list[Path] = []
+    failed = 0
+    for index, image_ref in enumerate(image_refs, 1):
+        path = await run_blocking(_save_pgr_image, role_dir, image_ref, index)
+        if path is None:
+            failed += 1
+        else:
+            saved.append(path)
+
+    if not saved:
+        return await _safe_send(
+            bot,
+            f'【{role_dir.name}】上传图片失败，请确认消息里附带的是图片。',
+        )
+
+    _invalidate_candidate_cache()
+    image_ids = [image_hash_id(path) for path in saved]
+    lines = [
+        f'【{role_dir.name}】上传战双老婆图片成功',
+        f'成功：{len(saved)} 张',
+        f'图片ID：{", ".join(image_ids)}',
+    ]
+    if failed:
+        lines.append(f'失败：{failed} 张')
+    await _safe_send(bot, '\n'.join(lines))
+
+
+def _pgr_candidates_by_name(
+    candidates: tuple[RoleCandidate, ...],
+    specified_name: str,
+) -> tuple[RoleCandidate, ...]:
+    target = _normalize_role_name(specified_name).casefold()
+    return tuple(
+        candidate
+        for candidate in candidates
+        if _normalize_role_name(candidate.name).casefold() == target
+    )
+
+
+def _stored_pgr_record(raw: object) -> WifeRecord | None:
+    if not isinstance(raw, dict) or _wife_state(raw) != 'owned':
+        return None
+    record = _record_from_dict(raw)
+    if record is None:
+        return None
+    if record.image.startswith(('http://', 'https://')):
+        return record
+    if not Path(record.image).is_file():
+        return None
+    return record
+
+
+async def _ensure_daily_pgr_wife_record(
+    ev: Event, specified_role: 'RoleCandidate | None' = None
+) -> WifeRecord | None:
+    key = _user_key(ev)
+    bucket = _daily_bucket_name('pgr')
+    context = await _load_daily_context(ev)
+    current_raw = context[bucket].get(key)
+    if isinstance(current_raw, dict) and _wife_state(current_raw) != 'owned':
+        return None
+    current = _stored_pgr_record(current_raw)
+    if current is not None:
+        return current
+
+    if specified_role is not None:
+        # 主人指定：跳过随机池，直接锁定指定角色
+        chosen = _pick_role_record((specified_role,), random)
+    else:
+        candidates = await _load_pgr_wife_candidates()
+        if not candidates:
+            return None
+        chosen = _pick_role_record(
+            candidates,
+            _daily_rng(ev, key, 'pgr_wife'),
+        )
+    if chosen is None:
+        return None
+
+    # 持有锁重新读取并二次校验，锁内串行替代旧的"无 await"原子段
+    async with _daily_context_lock(ev):
+        context = await _load_daily_context(ev)
+        existing_raw = context[bucket].get(key)
+        if isinstance(existing_raw, dict) and _wife_state(existing_raw) != 'owned':
+            logger.debug(f'{LOG_PREFIX} 写入前发现已离手的战双老婆记录，拒绝覆盖')
+            return None
+        existing = _stored_pgr_record(existing_raw)
+        if existing is not None:
+            return existing
+        value = _record_to_dict(chosen, ev, key)
+        await _save_daily_records(ev, [(bucket, key, value)])
+    logger.info(f'{LOG_PREFIX} 为用户 {key} 生成新的战双老婆: {chosen.name}')
+    return chosen
+
+
+def _pgr_result_text(record: WifeRecord) -> str | None:
+    if not _cfg_bool('DailyWifeSendText', True):
+        return None
+    metadata = _daily_kind_metadata('pgr')
+    template = str(_cfg(metadata.text_template_key) or metadata.text_template_default)
+    return template.format(name=record.name, role_id='/'.join(record.role_ids))
+
+
+async def _send_daily_pgr_wife(
+    bot: Bot,
+    ev: Event,
+    specified_name: str = '',
+) -> None:
+    if not _cfg_bool('DailyWifePgrEnabled', True):
+        return
+
+    is_master = _is_master(ev)
+    is_debug_active = _cfg_bool('DailyWifeDebugMode', False) and is_master
+    can_specify_role = _can_specify_wife(ev)
+    specified_name = _normalize_role_name(specified_name)
+    # 仅 Debug 模式保持临时预览不落库；主人指定同样写入每日记录，0 点随记录重置
+    is_transient_draw = is_debug_active
+
+    specified_role: RoleCandidate | None = None
+    if specified_name and not can_specify_role:
+        return await _safe_send(
+            bot,
+            '只有机器人主人或指定老婆白名单用户才能指定战双老婆。',
+        )
+
+    if specified_name and not is_transient_draw:
+        matched = _pgr_candidates_by_name(
+            await _load_pgr_wife_candidates(), specified_name
+        )
+        if not matched:
+            return await _safe_send(
+                bot,
+                f'战双老婆图库中没有角色【{specified_name}】。',
+            )
+        specified_role = matched[0]
+
+    if not is_transient_draw:
+        context = await _load_daily_context(ev)
+        current_raw = context[_daily_bucket_name('pgr')].get(_user_key(ev))
+        if specified_role is not None:
+            owned = _stored_pgr_record(current_raw)
+            if owned is not None:
+                return await _safe_send(
+                    bot,
+                    f'你今天已经有{owned.name}了，不要贪心！',
+                )
+        state = _wife_state(current_raw)
+        if state == 'divorced':
+            return await _safe_send(
+                bot,
+                '你今天已经和战双老婆离婚了，明天再来吧~',
+            )
+        if state == 'lost_stolen':
+            return await _safe_send(bot, '你的战双老婆已经被抢走了。')
+        if state == 'lost_gifted':
+            return await _safe_send(bot, '你的战双老婆已经送出去了。')
+
+        other_wife_name = await _get_other_daily_wife_name(ev, 'pgr')
+        if other_wife_name:
+            return await _safe_send(
+                bot,
+                f'你今天已经有{other_wife_name}了，不要贪心！',
+            )
+
+    if is_transient_draw:
+        candidates = await _load_pgr_wife_candidates()
+        if specified_name:
+            candidates = _pgr_candidates_by_name(candidates, specified_name)
+            if not candidates:
+                return await _safe_send(
+                    bot,
+                    f'战双老婆图库中没有角色【{specified_name}】。',
+                )
+        record = _pick_role_record(candidates, random)
+    else:
+        record = await _ensure_daily_pgr_wife_record(ev, specified_role=specified_role)
+    if record is None:
+        root = _pgr_wife_root()
+        return await _safe_send(
+            bot,
+            '战双老婆图库里还没有可用图片。\n'
+            f'把图片放成“{root}\\角色名\\图片文件”即可。',
+        )
+
+    if record.image.startswith(('http://', 'https://')):
+        await _send_role_image(
+            bot,
+            RoleCandidate(record.name, record.role_ids, (record.image,)),
+            record.image,
+            _pgr_result_text(record) or '',
+            ev.user_id,
+            ev.group_id is not None,
+            'pgr',
+        )
+        return
+
+    await _send_local_image(
+        bot,
+        record.image,
+        '这张战双老婆图片已经不存在，请重新发送命令。',
+        _pgr_result_text(record),
+        ev.user_id,
+        ev.group_id is not None,
+        'pgr',
+    )
+
+
+@specify_wife_sv.on_prefix(
+    ('今日战双老婆', 'jrzslp'),
+    block=True,
+    to_ai="""抽取当前用户今天的战双老婆。
+    机器人主人或指定老婆白名单用户可以指定战双角色名。
+    Args:
+        text: 战双角色名，例如“露西亚”；仅主人或白名单用户可用。
+    """,
+    covers=['战双帕弥什角色每日随机抽取，返回角色名与立绘'],
+    aliases=['今日老婆·抽战双老婆', '今日老婆·今日战双老婆'],
+)
+async def daily_pgr_wife_prefix(bot: Bot, ev: Event) -> None:
+    await _send_daily_pgr_wife(bot, ev, str(ev.text or '').strip())
+
+
+@pgr_wife_sv.on_fullmatch(
+    ('今日战双老婆', 'jrzslp'),
+    block=True,
+    to_ai="""随机抽取当前用户今天的战双老婆。
+    当用户说“今日战双老婆”“jrzslp”“我今天的战双老婆是谁”时调用。
+    Args:
+        text: 无需参数，留空。
+    """,
+    covers=['战双帕弥什角色每日随机抽取，返回角色名与立绘'],
+    aliases=['今日老婆·抽战双老婆', '今日老婆·今日战双老婆'],
+)
+async def daily_pgr_wife(bot: Bot, ev: Event) -> None:
+    await _send_daily_pgr_wife(bot, ev, '')
+
+
+@image_upload_sv.on_command(
+    ('上传战双老婆图片', '战双老婆上传图片'),
+    block=True,
+)
+async def upload_pgr_wife(bot: Bot, ev: Event) -> None:
+    await _send_upload_pgr_wife_images(bot, ev)

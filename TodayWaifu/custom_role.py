@@ -1,0 +1,456 @@
+"""TodayWaifu - custom_role module."""
+from __future__ import annotations
+
+from .shared import (
+    LOG_PREFIX,
+    IMAGE_EXTENSIONS,
+    CUSTOM_ROLE_ID_START,
+    UPLOAD_IMAGE_MAX_BYTES,
+    CUSTOM_ROLE_DELETE_PENDING,
+    CUSTOM_ROLE_DELETE_CONFIRM_SECONDS,
+    Bot,
+    Path,
+    Event,
+    Message,
+    MessageSegment,
+    PendingCustomRoleDelete,
+    re,
+    time,
+    logger,
+    shutil,
+    _user_key,
+    _safe_send,
+    _context_key,
+    _load_role_map,
+    custom_role_sv,
+    write_role_map,
+    image_upload_sv,
+    _can_upload_images,
+    _normalize_role_name,
+    _writable_role_map_path,
+    _image_message_from_path,
+    _writable_role_pile_root,
+    _invalidate_candidate_cache,
+)
+from .executor import run_blocking
+from .image_input import (
+    image_hash_id,
+    read_image_bytes,
+    collect_image_refs,
+    detect_image_suffix,
+    image_suffix_from_source,
+)
+
+
+def _role_ids_by_name(role_map: dict[str, str], role_name: str) -> tuple[str, ...]:
+    target = _normalize_role_name(role_name)
+    ids = [role_id for role_id, name in role_map.items() if _normalize_role_name(name) == target]
+    return tuple(sorted(ids, key=lambda item: int(item) if item.isdigit() else item))
+
+
+def _next_custom_role_id(role_map: dict[str, str], pile_root: Path) -> str:
+    used_ids: set[int] = set()
+    for role_id in role_map:
+        if role_id.isdigit():
+            used_ids.add(int(role_id))
+    if pile_root.is_dir():
+        for item in pile_root.iterdir():
+            if item.is_dir() and item.name.isdigit():
+                used_ids.add(int(item.name))
+
+    role_id = max([CUSTOM_ROLE_ID_START - 1, *(item for item in used_ids if item >= CUSTOM_ROLE_ID_START)]) + 1
+    while role_id in used_ids:
+        role_id += 1
+    return str(role_id)
+
+
+def _write_custom_role_map(path: Path, role_map: dict[str, str]) -> None:
+    """原子写回自定义老婆对照表 JSON。"""
+    write_role_map(path, role_map)
+
+
+def _clean_upload_role_name(raw: str, strip_wife_suffix: bool = False) -> str:
+    name = str(raw or '').strip().strip('"“”‘’')
+    name = re.sub(r'\s+', ' ', name)
+    if strip_wife_suffix and name.endswith('老婆') and len(name) > 2:
+        name = name[:-2].strip()
+    return name
+
+
+def _create_or_get_custom_role(role_name: str) -> tuple[str, bool, str | None]:
+    role_name = _clean_upload_role_name(role_name)
+    if not role_name:
+        return '', False, '请输入角色名，例如：创建老婆 达妮娅'
+
+    map_path = _writable_role_map_path()
+    role_map = _load_role_map(map_path) if map_path.is_file() else {}
+    pile_root = _writable_role_pile_root()
+    role_ids = _role_ids_by_name(role_map, role_name)
+    if role_ids:
+        role_id = role_ids[0]
+        (pile_root / role_id).mkdir(parents=True, exist_ok=True)
+        return role_id, False, None
+
+    role_id = _next_custom_role_id(role_map, pile_root)
+    role_map[role_id] = role_name
+    _write_custom_role_map(map_path, role_map)
+    (pile_root / role_id).mkdir(parents=True, exist_ok=True)
+    _invalidate_candidate_cache()
+    logger.info(f'{LOG_PREFIX} 创建自定义老婆角色: {role_name} -> {role_id}')
+    return role_id, True, None
+
+
+def _upload_image_refs(ev: Event) -> tuple[str, ...]:
+    return collect_image_refs(ev)
+
+
+def _image_suffix_from_source(source: str) -> str:
+    return image_suffix_from_source(source)
+
+
+def _detect_upload_image_suffix(data: bytes, source: str) -> str:
+    return detect_image_suffix(data, source)
+
+
+def _read_upload_image_bytes(source: str) -> tuple[bytes, str] | None:
+    return read_image_bytes(source, UPLOAD_IMAGE_MAX_BYTES)
+
+
+def _unique_upload_image_path(role_dir: Path, role_id: str, suffix: str, index: int) -> Path:
+    stamp = int(time.time() * 1000)
+    counter = 0
+    while True:
+        tail = f'_{counter}' if counter else ''
+        path = role_dir / f'{role_id}_{stamp}_{index}{tail}{suffix}'
+        if not path.exists():
+            return path
+        counter += 1
+
+
+def _custom_image_hash_id(path: Path | str) -> str:
+    return image_hash_id(path)
+
+
+def _custom_role_image_map(role_id: str) -> dict[str, Path]:
+    role_dir = _writable_role_pile_root() / str(role_id)
+    if not role_dir.is_dir():
+        return {}
+    result: dict[str, Path] = {}
+    for path in sorted(role_dir.iterdir(), key=lambda item: item.name.lower()):
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
+            result[_custom_image_hash_id(path)] = path
+    return result
+
+
+def _custom_role_ids_for_name(role_name: str) -> tuple[str, ...]:
+    map_path = _writable_role_map_path()
+    role_map = _load_role_map(map_path) if map_path.is_file() else {}
+    return _role_ids_by_name(role_map, role_name)
+
+
+def _custom_role_name_by_id(role_id: str) -> str:
+    map_path = _writable_role_map_path()
+    role_map = _load_role_map(map_path) if map_path.is_file() else {}
+    return role_map.get(str(role_id), str(role_id))
+
+
+def _remove_custom_role_map_ids(role_ids: tuple[str, ...]) -> None:
+    if not role_ids:
+        return
+    map_path = _writable_role_map_path()
+    if not map_path.is_file():
+        return
+    role_id_set = {str(role_id) for role_id in role_ids}
+    role_map = _load_role_map(map_path)
+    kept = {key: value for key, value in role_map.items() if key not in role_id_set}
+    if len(kept) != len(role_map):
+        _write_custom_role_map(map_path, kept)
+
+
+def _custom_role_delete_confirm_key(ev: Event) -> str:
+    return f'{_context_key(ev)}:{_user_key(ev)}'
+
+
+def _get_pending_custom_role_delete(ev: Event) -> PendingCustomRoleDelete | None:
+    key = _custom_role_delete_confirm_key(ev)
+    pending = CUSTOM_ROLE_DELETE_PENDING.get(key)
+    if not isinstance(pending, dict):
+        return None
+    try:
+        created_at = int(pending.get('created_at') or 0)
+    except (TypeError, ValueError):
+        created_at = 0
+    if time.time() - created_at > CUSTOM_ROLE_DELETE_CONFIRM_SECONDS:
+        CUSTOM_ROLE_DELETE_PENDING.pop(key, None)
+        return None
+    return pending
+
+
+def _set_pending_custom_role_delete(ev: Event, role_id: str, role_name: str, image_count: int) -> None:
+    if len(CUSTOM_ROLE_DELETE_PENDING) >= 1024:
+        oldest_key = min(
+            CUSTOM_ROLE_DELETE_PENDING,
+            key=lambda key: float(CUSTOM_ROLE_DELETE_PENDING[key].get('created_at') or 0),
+        )
+        CUSTOM_ROLE_DELETE_PENDING.pop(oldest_key, None)
+    CUSTOM_ROLE_DELETE_PENDING[_custom_role_delete_confirm_key(ev)] = {
+        'role_id': role_id,
+        'role_name': role_name,
+        'image_count': image_count,
+        'created_at': int(time.time()),
+    }
+
+
+def _clear_pending_custom_role_delete(ev: Event) -> None:
+    CUSTOM_ROLE_DELETE_PENDING.pop(_custom_role_delete_confirm_key(ev), None)
+
+
+def _custom_role_image_entries(role_name: str) -> tuple[str, str, list[tuple[str, Path]]] | None:
+    role_name = _clean_upload_role_name(role_name, strip_wife_suffix=True)
+    if not role_name:
+        return None
+    role_ids = _custom_role_ids_for_name(role_name)
+    if not role_ids:
+        return None
+    role_id = role_ids[0]
+    image_map = _custom_role_image_map(role_id)
+    return role_id, role_name, sorted(image_map.items(), key=lambda item: item[1].name.lower())
+
+
+def _resolve_custom_role_for_delete(role_name: str) -> tuple[str, str, list[tuple[str, Path]], str | None]:
+    entries = _custom_role_image_entries(role_name)
+    if entries is None:
+        cleaned = _clean_upload_role_name(role_name, strip_wife_suffix=True)
+        return '', cleaned, [], f'未找到自定义老婆【{cleaned or role_name}】。'
+    role_id, role_name, images = entries
+    return role_id, role_name, images, None
+
+
+def _delete_custom_role(role_id: str) -> int:
+    role_dir = _writable_role_pile_root() / str(role_id)
+    image_count = len(_custom_role_image_map(role_id))
+    if role_dir.is_dir():
+        shutil.rmtree(role_dir)
+    _remove_custom_role_map_ids((str(role_id),))
+    _invalidate_candidate_cache()
+    return image_count
+
+
+def _resolve_custom_image_for_delete(role_name: str, hash_id: str) -> tuple[str, str, Path | None, str | None]:
+    role_name = _clean_upload_role_name(role_name, strip_wife_suffix=True)
+    hash_id = str(hash_id or '').strip().lower()
+    if not role_name:
+        return '', '', None, '请输入角色名，例如：老婆删除图片达妮娅 abcd1234'
+    if not re.fullmatch(r'[0-9a-f]{8}', hash_id):
+        return '', role_name, None, '图片ID格式错误，请使用列表里显示的 8 位 ID。'
+
+    role_ids = _custom_role_ids_for_name(role_name)
+    if not role_ids:
+        return '', role_name, None, f'未找到自定义老婆【{role_name}】。'
+
+    role_id = role_ids[0]
+    image_map = _custom_role_image_map(role_id)
+    image_path = image_map.get(hash_id)
+    if image_path is None:
+        return role_id, role_name, None, f'【{role_name}】未找到图片ID：{hash_id}'
+    return role_id, role_name, image_path, None
+
+
+def _parse_delete_custom_image_text(text: str) -> tuple[str, str]:
+    raw = str(text or '').strip()
+    match = re.search(r'([0-9a-fA-F]{8})\s*$', raw)
+    if not match:
+        return _clean_upload_role_name(raw, strip_wife_suffix=True), ''
+    hash_id = match.group(1).lower()
+    role_name = _clean_upload_role_name(raw[: match.start()], strip_wife_suffix=True)
+    return role_name, hash_id
+
+
+def _save_upload_image_ref(role_dir: Path, role_id: str, source: str, index: int) -> Path | None:
+    image_data = _read_upload_image_bytes(source)
+    if image_data is None:
+        return None
+    data, suffix = image_data
+    role_dir.mkdir(parents=True, exist_ok=True)
+    path = _unique_upload_image_path(role_dir, role_id, suffix, index)
+    path.write_bytes(data)
+    return path
+
+
+async def _send_create_custom_wife_role(bot: Bot, ev: Event) -> list[str] | None:
+    role_name = _clean_upload_role_name(ev.text, strip_wife_suffix=True)
+    role_id, created, error = await run_blocking(
+        _create_or_get_custom_role,
+        role_name,
+    )
+    if error:
+        return await _safe_send(bot,error)
+
+    if created:
+        await _safe_send(bot,f'自定义老婆创建成功\n角色ID：{role_id}')
+    else:
+        await _safe_send(bot,f'自定义老婆已存在\n角色ID：{role_id}')
+
+
+async def _send_upload_custom_wife_images(bot: Bot, ev: Event) -> list[str] | None:
+    if not _can_upload_images(ev):
+        return await _safe_send(bot, '你不在图片上传白名单中。')
+
+    role_name = _clean_upload_role_name(ev.text, strip_wife_suffix=True)
+    if not role_name:
+        return await _safe_send(bot, '请输入角色名，例如：上传老婆图片 达妮娅，并附带图片。')
+
+    image_refs = _upload_image_refs(ev)
+    if not image_refs:
+        return await _safe_send(bot, f'请同时发送图片和命令，例如：上传老婆图片 {role_name}')
+
+    role_id, created, error = await run_blocking(
+        _create_or_get_custom_role,
+        role_name,
+    )
+    if error:
+        return await _safe_send(bot,error)
+
+    role_dir = _writable_role_pile_root() / role_id
+    saved: list[Path] = []
+    failed = 0
+    for index, image_ref in enumerate(image_refs, 1):
+        path = await run_blocking(_save_upload_image_ref, role_dir, role_id, image_ref, index)
+        if path is None:
+            failed += 1
+        else:
+            saved.append(path)
+
+    if not saved:
+        return await _safe_send(bot,f'【{role_name}】上传图片失败，请确认消息里附带的是图片。')
+
+    _invalidate_candidate_cache()
+    created_text = '（已自动创建角色）' if created else ''
+    success_ids = [_custom_image_hash_id(path) for path in saved]
+    msg = [
+        f'【{role_name}】上传老婆图片成功{created_text}',
+        f'角色ID：{role_id}',
+        f'成功：{len(saved)} 张',
+        f'图片ID：{", ".join(success_ids)}',
+    ]
+    if failed:
+        msg.append(f'失败：{failed} 张')
+    await _safe_send(bot,'\n'.join(msg))
+
+
+async def _send_custom_wife_image_list(bot: Bot, ev: Event) -> list[str] | None:
+    role_name = _clean_upload_role_name(ev.text, strip_wife_suffix=True)
+    entries = await run_blocking(_custom_role_image_entries, role_name)
+    if entries is None:
+        return await _safe_send(bot, '未找到这个自定义老婆，请先使用：创建老婆 角色名')
+
+    role_id, role_name, images = entries
+    if not images:
+        return await _safe_send(bot,f'自定义老婆【{role_name}】暂未上传过图片。')
+
+    nodes: list[Message | str] = []
+    for hash_id, path in images:
+        nodes.append(f'{role_name} 老婆图片ID：{hash_id}')
+        nodes.append(await _image_message_from_path(path))
+    await _safe_send(bot, MessageSegment.node(nodes))
+
+
+async def _send_request_delete_custom_wife_role(bot: Bot, ev: Event) -> list[str] | None:
+    role_name = _clean_upload_role_name(ev.regex_dict.get('role') or ev.text, strip_wife_suffix=True)
+    role_id, role_name, images, error = await run_blocking(
+        _resolve_custom_role_for_delete,
+        role_name,
+    )
+    if error:
+        return await _safe_send(bot, error)
+
+    _set_pending_custom_role_delete(ev, role_id, role_name, len(images))
+    await _safe_send(
+        bot,
+        f'将删除自定义老婆【{role_name}】\n'
+        f'角色ID：{role_id}\n'
+        f'图片数量：{len(images)}\n'
+        f'确认删除请在 {CUSTOM_ROLE_DELETE_CONFIRM_SECONDS} 秒内发送：确认删除老婆\n'
+        f'取消请发送：取消删除老婆',
+    )
+
+
+async def _send_confirm_delete_custom_wife_role(bot: Bot, ev: Event) -> list[str] | None:
+    pending = _get_pending_custom_role_delete(ev)
+    if pending is None:
+        return await _safe_send(bot, '没有待确认删除的自定义老婆。')
+
+    role_id = str(pending.get('role_id') or '')
+    role_name = str(pending.get('role_name') or role_id)
+    if not role_id:
+        _clear_pending_custom_role_delete(ev)
+        return await _safe_send(bot, '待删除记录无效，请重新发起删除。')
+
+    deleted_count = await run_blocking(_delete_custom_role, role_id)
+    _clear_pending_custom_role_delete(ev)
+    await _safe_send(bot, f'已删除自定义老婆【{role_name}】\n角色ID：{role_id}\n删除图片：{deleted_count} 张')
+
+
+async def _send_cancel_delete_custom_wife_role(bot: Bot, ev: Event) -> list[str] | None:
+    if _get_pending_custom_role_delete(ev) is None:
+        return await _safe_send(bot, '没有待取消的自定义老婆删除。')
+    _clear_pending_custom_role_delete(ev)
+    await _safe_send(bot, '已取消删除自定义老婆。')
+
+
+async def _send_delete_custom_wife_image(bot: Bot, ev: Event) -> list[str] | None:
+    role_name, hash_id = _parse_delete_custom_image_text(ev.text)
+    role_id, role_name, image_path, error = await run_blocking(
+        _resolve_custom_image_for_delete,
+        role_name,
+        hash_id,
+    )
+    if error:
+        return await _safe_send(bot,error)
+    if image_path is None:
+        return await _safe_send(bot,f'【{role_name}】未找到图片ID：{hash_id}')
+
+    try:
+        await run_blocking(image_path.unlink)
+    except OSError as exc:
+        logger.warning(f'{LOG_PREFIX} 删除自定义老婆图片失败: {image_path} -> {exc}')
+        return await _safe_send(bot,f'【{role_name}】图片删除失败：{hash_id}')
+
+    _invalidate_candidate_cache()
+    await _safe_send(bot,f'已删除【{role_name}】老婆图片：{hash_id}')
+
+
+@custom_role_sv.on_prefix(('创建老婆', '老婆创建'), block=True)
+async def custom_wife_create(bot: Bot, ev: Event) -> None:
+    await _send_create_custom_wife_role(bot, ev)
+
+
+@image_upload_sv.on_prefix(('上传老婆图片', '老婆上传图片'), block=True)
+async def custom_wife_upload(bot: Bot, ev: Event) -> None:
+    await _send_upload_custom_wife_images(bot, ev)
+
+
+@custom_role_sv.on_prefix(('查看老婆图片', '老婆图片列表', '老婆图片'), block=True)
+async def custom_wife_image_list(bot: Bot, ev: Event) -> None:
+    await _send_custom_wife_image_list(bot, ev)
+
+
+@custom_role_sv.on_prefix(('删除老婆图片', '老婆删除图片', '老婆删图片'), block=True)
+async def custom_wife_delete_image(bot: Bot, ev: Event) -> None:
+    await _send_delete_custom_wife_image(bot, ev)
+
+
+@custom_role_sv.on_fullmatch(('确认删除老婆', '老婆删除确认'), block=True)
+async def custom_wife_confirm_delete(bot: Bot, ev: Event) -> None:
+    await _send_confirm_delete_custom_wife_role(bot, ev)
+
+
+@custom_role_sv.on_fullmatch(('取消删除老婆', '老婆删除取消'), block=True)
+async def custom_wife_cancel_delete(bot: Bot, ev: Event) -> None:
+    await _send_cancel_delete_custom_wife_role(bot, ev)
+
+
+@custom_role_sv.on_regex(r'^(?:删除老婆|老婆删除)(?!图片|确认|取消)(?P<role>.+)$', block=True)
+async def custom_wife_delete_role(bot: Bot, ev: Event) -> None:
+    await _send_request_delete_custom_wife_role(bot, ev)
+

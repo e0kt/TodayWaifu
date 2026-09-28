@@ -1,0 +1,882 @@
+"""TodayWaifu - daily module."""
+from __future__ import annotations
+
+from .shared import (
+    LOG_PREFIX,
+    LIST_FORWARD_THRESHOLD,
+    Bot,
+    Event,
+    WifeRecord,
+    RoleCandidate,
+    MessageSegment,
+    MemberCandidate,
+    RoleRecordValue,
+    re,
+    _cfg,
+    time,
+    logger,
+    random,
+    _cfg_bool,
+    _user_key,
+    _daily_rng,
+    _event_rng,
+    _is_master,
+    _safe_send,
+    _wife_state,
+    wife_list_sv,
+    daily_wife_sv,
+    assign_wife_sv,
+    get_role_quote,
+    _filter_by_mode,
+    _record_to_dict,
+    husband_list_sv,
+    marry_member_sv,
+    specify_wife_sv,
+    _can_assign_wife,
+    _load_candidates,
+    _send_role_image,
+    daily_husband_sv,
+    _can_specify_wife,
+    _daily_item_title,
+    _pick_role_record,
+    _record_from_dict,
+    _send_local_image,
+    daily_nte_wife_sv,
+    _daily_bucket_name,
+    _husband_available,
+    _pick_group_member,
+    _save_daily_record,
+    _user_display_name,
+    _daily_context_lock,
+    _load_daily_context,
+    _save_daily_records,
+    _valid_display_name,
+    _daily_kind_metadata,
+    _normalize_role_name,
+    daily_normal_wife_sv,
+    _marry_member_enabled,
+    _roll_group_member_wife,
+    _get_event_target_user_id,
+    _load_group_display_names,
+    _get_other_daily_wife_name,
+)
+
+
+def _build_text(role: RoleCandidate, mode: str = 'wife', user_id: str = '') -> str:
+    if mode == 'wife' and _cfg_bool('DailyWifeNormalEnabled', False):
+        template = str(_cfg('DailyWifeNormalTextTemplate') or '').strip()
+        if not template:
+            return '你的老婆来啦！'
+    metadata = _daily_kind_metadata(mode)
+    template = str(_cfg(metadata.text_template_key) or metadata.text_template_default)
+    work = role.role_ids[0] if (role.role_ids and role.role_ids[0] != role.name) else ''
+    if mode == 'normal' and not work:
+        template = '你今天的老婆是{name}！'
+    lines = [
+        template.format(
+            name=role.name,
+            role_id=work or ('/'.join(role.role_ids) if role.role_ids else ''),
+            user_id=user_id,
+        )
+    ]
+    if mode != 'normal' and bool(_cfg_bool('DailyWifeSendRoleQuote', False)):
+        quote = get_role_quote(role.name)
+        if quote:
+            lines.append(quote)
+    if bool(_cfg('DailyWifeShowRoleId')) and mode != 'normal':
+        lines.append(f'角色ID：{"/".join(role.role_ids)}')
+    # 部分平台没有数字 QQ 号，群友只能复制这串 ID 来抢，故单独留开关
+    if user_id and bool(_cfg('DailyWifeShowUserId')) and mode != 'normal':
+        lines.append(f'你的ID：{user_id}')
+    return '\n'.join(lines)
+
+
+def _build_member_text(member: MemberCandidate, mode: str = 'daily') -> str:
+    if mode == 'marry':
+        template = str(_cfg('DailyWifeMarryGroupMemberTextTemplate') or '你娶到的群友是{name}')
+    else:
+        template = str(_cfg('DailyWifeGroupMemberTextTemplate') or '你今天的老婆是{name}')
+    return template.format(name=member.name, user_id=member.user_id)
+
+
+def _record_text(record: WifeRecord, mode: str = 'wife', user_id: str = '') -> str:
+    if record.record_type == 'member':
+        return _build_member_text(record.to_member())
+    return _build_text(record.to_role(), mode, user_id)
+
+
+async def _ensure_daily_wife_record(
+    ev: Event,
+    user_id: str | int | None = None,
+    mode: str = 'wife',
+    specified_role: 'RoleCandidate | None' = None,
+) -> WifeRecord | None:
+    bucket = _daily_bucket_name(mode)
+    salt = mode if mode != 'wife' else ''
+    key = _user_key(ev, user_id)
+
+    async with _daily_context_lock(ev):
+        context = await _load_daily_context(ev)
+        current = context[bucket].get(key)
+        if isinstance(current, dict):
+            if _wife_state(current) != 'owned':
+                logger.debug(f'{LOG_PREFIX} 命中已离手的 {mode} 记录，拒绝复用')
+                return None
+            record = _record_from_dict(current)
+            if record is not None:
+                logger.debug(f'{LOG_PREFIX} 命中已有的 {mode} 记录: {record.name}')
+                return record
+
+    chosen: WifeRecord | None = None
+    if specified_role is not None:
+        # 主人指定：跳过群友老婆与随机池，直接锁定指定角色
+        chosen = _pick_role_record((specified_role,), random)
+    elif mode == 'wife' and not _cfg_bool('DailyWifeNormalEnabled', False):
+        chosen = await _roll_group_member_wife(ev, key)
+    if chosen is None and specified_role is None:
+        rng = _daily_rng(ev, key, salt)
+        candidates, error = await _load_candidates(mode)
+        if error or not candidates:
+            logger.error(f'{LOG_PREFIX} 获取候选列表失败: {error or "候选列表为空"}')
+            return None
+        candidates = _filter_by_mode(candidates, mode)
+        if not candidates:
+            logger.warning(f'{LOG_PREFIX} 过滤后没有可用的 {mode} 角色')
+            return None
+        chosen = _pick_role_record(candidates, rng)
+        if chosen is None:
+            logger.warning(f'{LOG_PREFIX} 没有可用的 {mode} 角色图片')
+            return None
+    if chosen is None:
+        return None
+
+    async with _daily_context_lock(ev):
+        context = await _load_daily_context(ev)
+        existing = context[bucket].get(key)
+        if isinstance(existing, dict):
+            if _wife_state(existing) != 'owned':
+                logger.debug(f'{LOG_PREFIX} 写入前发现已离手的 {mode} 记录，拒绝覆盖')
+                return None
+            existing_record = _record_from_dict(existing)
+            if existing_record is not None:
+                logger.debug(f'{LOG_PREFIX} 写入前发现已有 {mode} 记录，直接复用: {existing_record.name}')
+                return existing_record
+
+        value = _record_to_dict(chosen, ev, key)
+        await _save_daily_record(ev, bucket, key, value)
+        logger.info(f'{LOG_PREFIX} 为用户 {key} 生成新的 {mode}: {chosen.name}')
+    return chosen
+
+
+async def _wife_list_items(ev: Event, mode: str = 'wife') -> tuple[str, list[tuple[int, str, str]]]:
+    bucket = 'husbands' if mode == 'husband' else 'wives'
+    title = '老公' if mode == 'husband' else '老婆'
+    # 群成员查询可能访问数据库/适配器，必须移出每日记录锁，避免阻塞其它群的抽取。
+    group_display_names = await _load_group_display_names(ev)
+    async with _daily_context_lock(ev):
+        context = await _load_daily_context(ev)
+        wives = context.get(bucket, {})
+        if not isinstance(wives, dict):
+            wives = {}
+
+        data_changed = False
+        changed_records: list[tuple[str, str, RoleRecordValue]] = []
+        items: list[tuple[int, str, str]] = []
+        seen_users: set[str] = set()
+        for user_id, raw_record in wives.items():
+            if not isinstance(raw_record, dict):
+                continue
+            record = _record_from_dict(raw_record)
+            if record is None:
+                continue
+            seen_users.add(user_id)
+            display_name = _valid_display_name(raw_record.get('display_name'), user_id)
+            if not display_name:
+                display_name = group_display_names.get(str(user_id), '')
+                if display_name:
+                    updated_record = dict(raw_record)
+                    updated_record['display_name'] = display_name
+                    updated_record['display_name_source'] = 'coreuser'
+                    updated_record['display_name_updated_at'] = int(time.time())
+                    data_changed = True
+                    changed_records.append((bucket, str(user_id), updated_record))
+                    raw_record = updated_record
+            if not display_name:
+                display_name = str(user_id)
+            updated_at = raw_record.get('updated_at')
+            try:
+                order = int(updated_at)
+            except (TypeError, ValueError):
+                order = 0
+            state = _wife_state(raw_record)
+            # 被抢但有补偿老婆的，留给 safe_wives 循环显示补偿名字，不显示"被抢走了~"
+            if state == 'lost_stolen' and isinstance(context.get('safe_wives', {}).get(user_id), dict):
+                continue
+            if state == 'lost_stolen':
+                wife_name = '被抢走了~'
+            elif state == 'lost_gifted':
+                wife_name = '送出去了~'
+            elif state == 'divorced':
+                wife_name = '离婚了~'
+            else:
+                wife_name = record.name
+
+            items.append((order, display_name, wife_name))
+
+        # 补偿老婆（safe_wives）：被抢后重抽的补偿记录，显示"(补)"后缀
+        if mode == 'wife':
+            safe_wives = context.get('safe_wives', {})
+            if isinstance(safe_wives, dict):
+                for user_id, raw_record in safe_wives.items():
+                    if not isinstance(raw_record, dict):
+                        continue
+                    record = _record_from_dict(raw_record)
+                    if record is None:
+                        continue
+                    seen_users.add(user_id)
+                    display_name = _valid_display_name(raw_record.get('display_name'), user_id)
+                    if not display_name:
+                        display_name = group_display_names.get(str(user_id), '')
+                        if display_name:
+                            updated_record = dict(raw_record)
+                            updated_record['display_name'] = display_name
+                            updated_record['display_name_source'] = 'coreuser'
+                            updated_record['display_name_updated_at'] = int(time.time())
+                            data_changed = True
+                            changed_records.append(('safe_wives', str(user_id), updated_record))
+                            raw_record = updated_record
+                    if not display_name:
+                        display_name = str(user_id)
+                    updated_at = raw_record.get('updated_at')
+                    try:
+                        order = int(updated_at)
+                    except (TypeError, ValueError):
+                        order = 0
+                    state = _wife_state(raw_record)
+                    if state == 'divorced':
+                        items.append((order, display_name, '离婚了~'))
+                    else:
+                        items.append((order, display_name, record.name + '(补)'))
+
+        if not items:
+            return f'今天本群还没有可用的{title}记录。', []
+
+        if data_changed:
+            await _save_daily_records(ev, changed_records)
+
+    items.sort(key=lambda item: (item[0], item[1]))
+    return f'今日{title}列表：', items
+
+
+def _wife_list_text_from_items(title_text: str, items: list[tuple[int, str, str]]) -> str:
+    if not items:
+        return title_text
+    lines = [title_text]
+    lines.extend(
+        f'{index}. {display_name} → {wife_name}'
+        for index, (_, display_name, wife_name) in enumerate(items, 1)
+    )
+    return '\n'.join(lines)
+
+
+async def _wife_list_text(ev: Event, mode: str = 'wife') -> str:
+    title_text, items = await _wife_list_items(ev, mode)
+    return _wife_list_text_from_items(title_text, items)
+
+
+
+async def _send_record_image(
+    bot: Bot,
+    record: WifeRecord,
+    mode: str = 'wife',
+    user_id: str | int | None = None,
+    is_group: bool = True,
+) -> None:
+    text = (
+        _record_text(record, mode, str(user_id or ''))
+        if bool(_cfg('DailyWifeSendText'))
+        else None
+    )
+    if record.record_type == 'member':
+        await _send_local_image(
+            bot,
+            record.image,
+            '本地群友头像文件不存在，请稍后重试。',
+            text,
+            user_id,
+            is_group,
+            mode,
+        )
+        return
+    await _send_role_image(bot, record.to_role(), record.image, text, user_id, is_group, mode)
+
+
+
+async def _send_daily_wife(
+    bot: Bot, ev: Event, mode: str = 'wife', specified_name: str = ''
+) -> list[str] | None:
+    title = _daily_item_title(mode)
+    logger.debug(
+        f'{LOG_PREFIX} 用户 {ev.user_id} 在群 {ev.group_id or "direct"} '
+        f'请求 {title} (指定: {specified_name or "无"})'
+    )
+
+    is_master = _is_master(ev)
+    is_debug_active = _cfg_bool('DailyWifeDebugMode', False) and is_master
+    can_specify_role = _can_specify_wife(ev)
+    specified_name = _normalize_role_name(specified_name)
+    # 仅 Debug 模式保持临时预览不落库；主人指定同样写入每日记录，0 点随记录重置
+    is_transient_draw = is_debug_active
+
+    specified_role: RoleCandidate | None = None
+    if specified_name and not can_specify_role:
+        logger.warning(
+            f'{LOG_PREFIX} 用户 {ev.user_id} 尝试指定角色 {specified_name}，已拒绝'
+        )
+        return await _safe_send(
+            bot,
+            f'只有机器人主人或指定老婆白名单用户才能指定{title}哦。',
+        )
+
+    if specified_name and not is_transient_draw:
+        candidates, error = await _load_candidates(mode)
+        if error or not candidates:
+            return await _safe_send(bot, error or '没有找到可用角色。')
+        target_candidates = [
+            c for c in candidates
+            if c.name == specified_name
+            or (mode == 'normal' and (
+                specified_name.casefold() in c.name.casefold()
+                or any(specified_name.casefold() in str(r_id).casefold() for r_id in c.role_ids)
+            ))
+        ]
+        if not target_candidates:
+            return await _safe_send(
+                bot,
+                f'未找到名为“{specified_name}”的{title}角色。',
+            )
+        specified_role = target_candidates[0]
+
+    if not is_transient_draw:
+        other_wife_name = await _get_other_daily_wife_name(ev, mode)
+        if other_wife_name:
+            return await _safe_send(
+                bot,
+                f'你今天已经有{other_wife_name}了，不要贪心！',
+            )
+
+    if not is_transient_draw:
+        context = await _load_daily_context(ev)
+        user_key = _user_key(ev)
+        bucket = _daily_bucket_name(mode)
+        current_record = context[bucket].get(user_key)
+
+        # 离手即结算：老婆被抢走后可补偿重抽一次（safe_wife），送出/离婚仍锁死；老公离手后也锁死。
+        state = _wife_state(current_record)
+        if state == 'owned' and specified_role is not None and isinstance(current_record, dict):
+            existing = _record_from_dict(current_record)
+            if existing is not None:
+                return await _safe_send(
+                    bot,
+                    f'你今天已经有{existing.name}了，不要贪心！',
+                )
+        if state == 'lost_stolen' and mode == 'wife':
+            # 已有补偿老婆的直接展示
+            safe_record = context['safe_wives'].get(user_key)
+            if isinstance(safe_record, dict):
+                safe_wife = _record_from_dict(safe_record)
+                if safe_wife is not None:
+                    logger.debug(f'{LOG_PREFIX} 用户 {ev.user_id} 展示已有的补偿老婆: {safe_wife.name}')
+                    return await _send_record_image(bot, safe_wife, mode, ev.user_id, ev.group_id is not None)
+
+            # 未抽过补偿老婆：抽一个，写入 safe_wives；主人指定时直接用指定角色
+            wife_name = current_record.get('name', '老婆')
+            stolen_by_name = current_record.get('stolen_by_name') or current_record.get('stolen_by')
+            if specified_role is not None:
+                safe_wife = _pick_role_record((specified_role,), random)
+            else:
+                candidates, error = await _load_candidates(mode)
+                if error or not candidates:
+                    return await _safe_send(bot, error or '没有找到可用角色。')
+                if not candidates:
+                    return await _safe_send(bot, f'没有找到可用的{title}角色。')
+                rng = _daily_rng(ev, user_key, f'{mode}_safe')
+                candidates = _filter_by_mode(candidates, mode)
+                safe_wife = _pick_role_record(candidates, rng)
+            if safe_wife is None:
+                logger.warning(f'{LOG_PREFIX} 补偿抽取没有可用图片')
+                return await _safe_send(bot, f'没有找到可用的{title}角色。')
+
+            # 候选加载期间可能有其它协程写入，持锁重新加载并复核状态后再落库
+            reused_safe_wife: WifeRecord | None = None
+            state_changed = False
+            async with _daily_context_lock(ev):
+                context = await _load_daily_context(ev)
+                current_record = context[bucket].get(user_key)
+                if _wife_state(current_record) != 'lost_stolen':
+                    state_changed = True
+                else:
+                    latest_safe = context['safe_wives'].get(user_key)
+                    if isinstance(latest_safe, dict):
+                        reused_safe_wife = _record_from_dict(latest_safe)
+                    if reused_safe_wife is None:
+                        new_safe_record = _record_to_dict(safe_wife, ev, user_key)
+                        new_safe_record['safe'] = True
+                        await _save_daily_records(
+                            ev,
+                            [('safe_wives', user_key, new_safe_record)],
+                        )
+
+            if state_changed:
+                # 状态已变化（离婚/赠送等），重走标准流程给出对应提示
+                return await _send_daily_wife(bot, ev, mode, specified_name='')
+            if reused_safe_wife is not None:
+                logger.debug(f'{LOG_PREFIX} 用户 {ev.user_id} 展示已有的补偿老婆: {reused_safe_wife.name}')
+                return await _send_record_image(bot, reused_safe_wife, mode, ev.user_id, ev.group_id is not None)
+
+            logger.info(f'{LOG_PREFIX} 用户 {ev.user_id} 的老婆被抢，补偿抽取: {safe_wife.name}')
+            return await _send_role_image(
+                bot, safe_wife.to_role(), safe_wife.image,
+                text=f'你的{wife_name}已经被{stolen_by_name}抢走了…\n但你迎来了新的{title}{safe_wife.name}！',
+                user_id=ev.user_id,
+                is_group=ev.group_id is not None,
+            )
+        if state == 'lost_stolen':
+            item_name = current_record.get('name', title) if isinstance(current_record, dict) else title
+            stolen_by_name = current_record.get('stolen_by_name') or current_record.get('stolen_by')
+            return await _safe_send(
+                bot,
+                f'你的{item_name}已经被{stolen_by_name}抢走了，今天就先忍忍吧~',
+            )
+        if state == 'lost_gifted':
+            wife_name = current_record.get('name', title)
+            gifted_to_name = current_record.get('gifted_to_name') or current_record.get('gifted_to')
+            logger.debug(f'{LOG_PREFIX} 用户 {ev.user_id} 的{title}已送出，拒绝分配新角色')
+            return await _safe_send(
+                bot,
+                f'你的{wife_name}已经送给{gifted_to_name}了，今天就先忍忍吧~',
+            )
+        if state == 'divorced':
+            item_name = current_record.get('name', title) if isinstance(current_record, dict) else title
+            return await _safe_send(
+                bot,
+                f'你今天已经和{item_name}离婚了，明天再来吧~',
+            )
+
+    record: WifeRecord | None = None
+
+    if is_transient_draw:
+        if is_debug_active:
+            logger.debug(f'{LOG_PREFIX} 主人 Debug 模式开启')
+        if specified_name:
+            logger.debug(f'{LOG_PREFIX} 主人指定抽取 {title}: {specified_name}')
+        candidates, error = await _load_candidates(mode)
+        if error or not candidates:
+            return await _safe_send(
+                bot,
+                error or '没有找到可用角色。',
+            )
+        if not candidates:
+            return await _safe_send(
+                bot,
+                f'没有找到可用的{title}角色。',
+            )
+        if specified_name:
+            target_candidates = [c for c in candidates if c.name == specified_name]
+            if not target_candidates:
+                return await _safe_send(
+                    bot,
+                    f'未找到名为“{specified_name}”的{title}角色。',
+                )
+            candidates = tuple(target_candidates)
+            record = _pick_role_record(candidates, random)
+        elif record is None:
+            candidates = _filter_by_mode(candidates, mode)
+            record = _pick_role_record(candidates, random)
+        if record is None:
+            logger.warning(f'{LOG_PREFIX} Debug 抽取没有可用图片')
+            return await _safe_send(bot, f'没有找到可用的{title}角色。')
+    else:
+        record = await _ensure_daily_wife_record(ev, mode=mode, specified_role=specified_role)
+        if record is None:
+            if specified_role is not None:
+                return await _safe_send(
+                    bot,
+                    f'未找到“{specified_role.name}”可用的{title}图片。',
+                )
+            return await _safe_send(bot, f'没有找到可用的{title}角色。')
+
+    if record.record_type == 'member':
+        member = record.to_member()
+        logger.debug(
+            f'{LOG_PREFIX} mode={mode} user={ev.user_id} group={ev.group_id or "direct"} '
+            f'member={member.name} qq={member.user_id} avatar={record.image} debug={is_debug_active}'
+        )
+    else:
+        role = record.to_role()
+        logger.debug(
+            f'{LOG_PREFIX} mode={mode} user={ev.user_id} group={ev.group_id or "direct"} '
+            f'role={role.name} ids={role.role_ids} image={record.image} debug={is_debug_active}'
+        )
+    await _send_record_image(bot, record, mode, ev.user_id, ev.group_id is not None)
+
+
+def _assignment_role_name(ev: Event, target_user_id: str) -> str:
+    text = str(ev.text or '').strip()
+    if not text:
+        return ''
+
+    text = re.sub(r'\[CQ:at,[^\]]*\]', ' ', text)
+    text = re.sub(r'<(?:qqbot-)?at[^>]*>', ' ', text)
+    text = re.sub(r'<qqbot-at-user[^>]*/?>', ' ', text)
+    text = re.sub(r'@\S+', ' ', text)
+    if target_user_id:
+        text = text.replace(target_user_id, ' ')
+    text = re.sub(r'\b(?:qq|QQ|id|user_id|openid|open_id)\s*[:=]\s*\S+', ' ', text)
+    text = re.sub(r'[，,。；;：:\n\r\t]+', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+
+    for prefix in ('给', '把', '将', '为'):
+        if text.startswith(prefix):
+            text = text[len(prefix):].strip()
+    for word in ('分配老婆', '分配今日老婆', '分配', '老婆'):
+        text = text.replace(word, ' ')
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def _find_assignable_wife(candidates: tuple[RoleCandidate, ...], role_name: str) -> RoleCandidate | None:
+    target = _normalize_role_name(role_name)
+    for candidate in candidates:
+        if _normalize_role_name(candidate.name) == target:
+            return candidate
+    for candidate in candidates:
+        if role_name in candidate.role_ids:
+            return candidate
+    return None
+
+
+async def _send_assign_wife(bot: Bot, ev: Event) -> None:
+    logger.info(f'{LOG_PREFIX} 用户 {ev.user_id} 发起主人分配老婆命令')
+    if not _can_assign_wife(ev):
+        return await _safe_send(bot, '只有机器人主人或分配老婆白名单用户可以分配老婆。')
+
+    target_user_id = _get_event_target_user_id(ev)
+    if not target_user_id:
+        return await _safe_send(bot, '要分配给谁？用法：分配老婆 @对方 角色名')
+
+    role_name = _assignment_role_name(ev, str(target_user_id))
+    if not role_name:
+        return await _safe_send(bot, '要分配哪个老婆？用法：分配老婆 @对方 角色名')
+
+    candidates, error = await _load_candidates('wife')
+    if error or not candidates:
+        return await _safe_send(bot, error or '没有找到可用角色。')
+
+    candidates = _filter_by_mode(candidates, 'wife')
+    role = _find_assignable_wife(candidates, role_name)
+    if role is None:
+        return await _safe_send(bot, f'未找到名为“{role_name}”的老婆角色。')
+
+    record = _pick_role_record((role,), random)
+    if record is None:
+        logger.warning(f'{LOG_PREFIX} 主人分配老婆未找到可用图片: {role.name}')
+        return await _safe_send(bot, f'未找到“{role.name}”可用的老婆图片。')
+    image = record.image
+    target_key = str(target_user_id)
+
+    assigned_record = _record_to_dict(record, ev, target_key)
+    assigned_record['assigned_by'] = _user_key(ev)
+    assigned_record['assigned_by_name'] = _user_display_name(ev)
+    deletes = [('safe_wives', target_key)]
+    async with _daily_context_lock(ev):
+        await _save_daily_records(ev, [('wives', target_key, assigned_record)], deletes)
+
+    logger.info(
+        f'{LOG_PREFIX} 主人 {ev.user_id} 将老婆 {role.name} 分配给 {target_key}, '
+        f'ids={role.role_ids} image={image}'
+    )
+    await _send_role_image(
+        bot,
+        role,
+        image,
+        f'已把今天的老婆{role.name}分配给对方。',
+        target_key,
+        ev.group_id is not None,
+    )
+
+
+async def _send_group_member_wife(bot: Bot, ev: Event) -> list[str] | None:
+    if not _marry_member_enabled():
+        return
+    logger.info(f'{LOG_PREFIX} 用户 {ev.user_id} 触发了娶群友命令')
+    if not ev.group_id:
+        return await _safe_send(bot,'这个命令只能在群聊里使用。')
+
+    member = await _pick_group_member(ev, _event_rng(ev))
+    if member is None:
+        return await _safe_send(bot,'没有获取到本群成员，暂时娶不到群友。')
+
+    logger.info(
+        f'{LOG_PREFIX} marry_member user={ev.user_id} group={ev.group_id} '
+        f'member={member.name} qq={member.user_id} avatar={member.avatar}'
+    )
+    text = _build_member_text(member, 'marry') if bool(_cfg('DailyWifeSendText')) else None
+    await _send_local_image(
+        bot,
+        member.avatar,
+        '本地群友头像文件不存在，请稍后重试。',
+        text,
+        ev.user_id,
+        ev.group_id is not None,
+    )
+
+
+async def _send_wife_list(bot: Bot, ev: Event, mode: str = 'wife') -> None:
+    logger.debug(f'{LOG_PREFIX} 用户 {ev.user_id} 在群 {ev.group_id} 请求了 {mode} 列表')
+    title_text, items = await _wife_list_items(ev, mode)
+    if len(items) > LIST_FORWARD_THRESHOLD:
+        await _safe_send(
+            bot,
+            MessageSegment.node([_wife_list_text_from_items(title_text, items)]),
+        )
+        return
+    await _safe_send(bot, _wife_list_text_from_items(title_text, items))
+
+
+@specify_wife_sv.on_prefix(
+    ('今日老婆', '娶婆娘', 'jrlp', 'qlp'),
+    block=True,
+    to_ai="""抽取当前用户今天的老婆。
+    当用户说“今日老婆”“帮我娶个老婆”“我今天的老婆是谁”时调用。
+    如果用户指定了角色名，把角色名放在 text 里，例如“今汐”“长离”；如果用户要看列表，text 填“列表”。
+    Args:
+        text: 可选，指定老婆角色名；留空表示随机抽取今日老婆；填“列表”表示查看老婆列表。
+    """,
+    covers=['鸣潮角色每日随机抽取（每天一次、全天固定），返回角色名与立绘'],
+    aliases=['今日老婆·抽老婆', '今日老婆·今日老婆', '今日老婆·娶婆娘'],
+)
+async def daily_wife_prefix(bot: Bot, ev: Event) -> list[str] | None:
+    specified_name = str(ev.text or '').strip()
+    # GsCore may select this prefix matcher before the exact help matcher and
+    # expose "今日老婆帮助" as command="今日老婆", text="帮助". Route that
+    # unambiguous alias to the real help handler instead of looking up a role.
+    if str(ev.command or '').strip() in {'今日老婆', '娶婆娘', 'jrlp', 'qlp'} and specified_name == '帮助':
+        from .help import daily_wife_help
+
+        return await daily_wife_help(bot, ev)
+    if specified_name == '列表':
+        return await _send_wife_list(bot, ev, mode='wife')
+    await _send_daily_wife(bot, ev, mode='wife', specified_name=specified_name)
+
+
+@daily_wife_sv.on_fullmatch(
+    ('今日老婆', '娶婆娘', 'jrlp', 'qlp'),
+    block=True,
+    to_ai="""随机抽取当前用户今天的老婆。
+    当用户说“今日老婆”“我今天老婆是谁”“帮我娶个老婆”且没有指定角色名时调用。
+    Args:
+        text: 无需参数，留空。
+    """,
+    covers=['鸣潮角色每日随机抽取（每天一次、全天固定），返回角色名与立绘'],
+    aliases=['今日老婆·抽老婆', '今日老婆·今日老婆', '今日老婆·娶婆娘'],
+)
+async def daily_wife_full(bot: Bot, ev: Event) -> None:
+    await _send_daily_wife(bot, ev, mode='wife', specified_name='')
+
+
+@specify_wife_sv.on_prefix(
+    '今日异环老婆',
+    block=True,
+    to_ai="""抽取当前用户今天的异环老婆。
+    该功能需要先在控制台开启。机器人主人或指定老婆白名单用户可把角色名放入 text。
+    Args:
+        text: 异环角色名；仅机器人主人或指定老婆白名单用户可用。
+    """,
+    covers=['异环(NTE)角色每日随机抽取，返回角色名与立绘'],
+    aliases=['今日老婆·抽异环老婆', '今日老婆·今日异环老婆'],
+)
+async def daily_nte_wife_prefix(bot: Bot, ev: Event) -> None:
+    if not _cfg_bool('DailyWifeNteEnabled', False):
+        return
+    await _send_daily_wife(bot, ev, mode='nte', specified_name=str(ev.text or '').strip())
+
+
+@daily_nte_wife_sv.on_fullmatch(
+    '今日异环老婆',
+    block=True,
+    to_ai="""随机抽取当前用户今天的异环老婆。
+    该功能需要先在控制台开启。
+    Args:
+        text: 无需参数，留空。
+    """,
+    covers=['异环(NTE)角色每日随机抽取，返回角色名与立绘'],
+    aliases=['今日老婆·抽异环老婆', '今日老婆·今日异环老婆'],
+)
+async def daily_nte_wife_full(bot: Bot, ev: Event) -> None:
+    if not _cfg_bool('DailyWifeNteEnabled', False):
+        return
+    await _send_daily_wife(bot, ev, mode='nte', specified_name='')
+
+
+@specify_wife_sv.on_prefix(
+    ('今日普通老婆', '普通老婆', 'ptlp', 'jrptlp'),
+    block=True,
+    to_ai="""抽取当前用户今天的普通老婆（二次元作品角色）。
+    当用户说“今日普通老婆”“普通老婆”时调用。
+    如果用户指定了角色名或作品名，把角色名或作品名放在 text 里；如果用户要看列表，text 填“列表”。
+    Args:
+        text: 可选，指定普通老婆角色名或作品名；留空表示随机抽取今日普通老婆；填“列表”表示查看普通老婆列表。
+    """,
+    covers=['二次元动漫角色（跨作品）每日随机抽取，返回「来自{作品}的{角色}」'],
+    aliases=['今日老婆·抽普通老婆', '今日老婆·今日普通老婆', '今日老婆·动漫老婆'],
+)
+async def daily_normal_wife_prefix(bot: Bot, ev: Event) -> None:
+    specified_name = str(ev.text or '').strip()
+    if specified_name == '列表':
+        return await _send_wife_list(bot, ev, mode='normal')
+    await _send_daily_wife(bot, ev, mode='normal', specified_name=specified_name)
+
+
+@daily_normal_wife_sv.on_fullmatch(
+    ('今日普通老婆', '普通老婆', 'ptlp', 'jrptlp'),
+    block=True,
+    to_ai="""随机抽取当前用户今天的普通老婆（二次元作品角色）。
+    当用户说“今日普通老婆”“普通老婆”且没有指定角色名时调用。
+    Args:
+        text: 无需参数，留空。
+    """,
+    covers=['二次元动漫角色（跨作品）每日随机抽取，返回「来自{作品}的{角色}」'],
+    aliases=['今日老婆·抽普通老婆', '今日老婆·今日普通老婆', '今日老婆·动漫老婆'],
+)
+async def daily_normal_wife_full(bot: Bot, ev: Event) -> None:
+    await _send_daily_wife(bot, ev, mode='normal', specified_name='')
+
+
+@wife_list_sv.on_fullmatch(
+    ('普通老婆列表', '查看普通老婆列表'),
+    block=True,
+    to_ai="""查看今日已抽取的普通老婆记录列表。
+    当用户询问“普通老婆列表”时调用。
+    Args:
+        text: 无需参数，留空。
+    """,
+    covers=['普通（动漫）老婆的今日抽取记录与可抽角色'],
+    aliases=['今日老婆·普通老婆列表', '今日老婆·动漫老婆列表'],
+)
+async def daily_normal_wife_list(bot: Bot, ev: Event) -> None:
+    await _send_wife_list(bot, ev, mode='normal')
+
+
+@wife_list_sv.on_fullmatch(
+    ('老婆列表', '查看老婆列表'),
+    block=True,
+    to_ai="""查看可抽取的老婆角色列表。
+    当用户询问“老婆列表”“有哪些老婆可以抽”时调用。
+    Args:
+        text: 无需参数，留空。
+    """,
+    covers=['鸣潮可抽取角色名单与今日已抽取记录'],
+    aliases=['今日老婆·老婆列表', '今日老婆·可抽角色'],
+)
+async def daily_wife_list(bot: Bot, ev: Event) -> None:
+    await _send_wife_list(bot, ev)
+
+
+@assign_wife_sv.on_prefix(
+    ('分配老婆', '分配今日老婆'),
+    block=True,
+    to_ai="""为指定用户分配今日老婆。
+    当管理员或用户说“给某人分配老婆”“分配今日老婆 @某人 角色名”时调用。
+    Args:
+        text: 分配参数，通常包含目标用户和老婆名，例如“@用户 今汐”。
+    """,
+    covers=['机器人主人为指定用户分配今日老婆（含角色名）'],
+    aliases=['今日老婆·分配老婆'],
+)
+async def assign_wife(bot: Bot, ev: Event) -> None:
+    await _send_assign_wife(bot, ev)
+
+
+@assign_wife_sv.on_fullmatch(
+    ('分配老婆', '分配今日老婆'),
+    block=True,
+    to_ai="""显示分配今日老婆的用法。
+    当用户只说“分配老婆”但没有提供目标或角色名时调用。
+    Args:
+        text: 无需参数，留空。
+    """,
+    covers=['「分配老婆」的用法说明'],
+    aliases=['今日老婆·分配老婆用法'],
+)
+async def assign_wife_usage(bot: Bot, ev: Event) -> None:
+    await _send_assign_wife(bot, ev)
+
+
+@specify_wife_sv.on_prefix(
+    '今日老公',
+    block=True,
+    to_ai="""抽取当前用户今天的老公。
+    当用户说“今日老公”“我今天的老公是谁”时调用。
+    如果用户指定了角色名，把角色名放在 text 里；如果用户要看列表，text 填“列表”。
+    Args:
+        text: 可选，指定老公角色名；留空表示随机抽取今日老公；填“列表”表示查看老公列表。
+    """,
+    covers=['鸣潮男性角色每日随机抽取，返回角色名与立绘'],
+    aliases=['今日老婆·抽老公', '今日老婆·今日老公'],
+)
+async def daily_husband_prefix(bot: Bot, ev: Event) -> None:
+    if not _husband_available():
+        return
+    specified_name = str(ev.text or '').strip()
+    if specified_name == '列表':
+        return await _send_wife_list(bot, ev, mode='husband')
+    await _send_daily_wife(bot, ev, mode='husband', specified_name=specified_name)
+
+
+@daily_husband_sv.on_fullmatch(
+    '今日老公',
+    block=True,
+    to_ai="""随机抽取当前用户今天的老公。
+    当用户说“今日老公”“我今天老公是谁”且没有指定角色名时调用。
+    Args:
+        text: 无需参数，留空。
+    """,
+    covers=['鸣潮男性角色每日随机抽取，返回角色名与立绘'],
+    aliases=['今日老婆·抽老公', '今日老婆·今日老公'],
+)
+async def daily_husband_full(bot: Bot, ev: Event) -> None:
+    if not _husband_available():
+        return
+    await _send_daily_wife(bot, ev, mode='husband', specified_name='')
+
+
+@husband_list_sv.on_fullmatch(
+    ('老公列表', '查看老公列表'),
+    block=True,
+    to_ai="""查看可抽取的老公角色列表。
+    当用户询问“老公列表”“有哪些老公可以抽”时调用。
+    Args:
+        text: 无需参数，留空。
+    """,
+    covers=['鸣潮可抽取男性角色名单与今日已抽取记录'],
+    aliases=['今日老婆·老公列表', '今日老婆·可抽老公'],
+)
+async def daily_husband_list(bot: Bot, ev: Event) -> None:
+    if not _husband_available():
+        return
+    await _send_wife_list(bot, ev, mode='husband')
+
+
+@marry_member_sv.on_fullmatch(
+    ('娶群友', '取群友'),
+    block=True,
+    to_ai="""随机抽取当前群里的一个群友作为今日互动对象。
+    当用户说“娶群友”“随机娶一个群友”“帮我抽个群友”时调用；只能在群聊使用。
+    Args:
+        text: 无需参数，留空。
+    """,
+    covers=['从当前群成员中随机抽取一位作为今日互动对象'],
+    aliases=['今日老婆·娶群友', '今日老婆·抽群友'],
+)
+async def group_member_wife(bot: Bot, ev: Event) -> None:
+    await _send_group_member_wife(bot, ev)

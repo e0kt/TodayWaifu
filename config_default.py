@@ -5,12 +5,12 @@ from typing import Dict
 from gsuid_core.data_store import get_res_path
 from gsuid_core.utils.plugins_config.models import (
     GSC,
-    GsBoolConfig,
     GsDivider,
-    GsImageConfig,
     GsIntConfig,
-    GsListStrConfig,
     GsStrConfig,
+    GsBoolConfig,
+    GsImageConfig,
+    GsListStrConfig,
 )
 
 SHOW_CONFIG_PATH = get_res_path(['TodayWaifu', 'show'])
@@ -19,8 +19,31 @@ CONFIG_DEFAULT: Dict[str, GSC] = {
     '_DividerImageSource': GsDivider('图片数据源', ''),
     'DailyWifeImageSource': GsStrConfig(
         '图片数据源',
-        '选择 local 使用本地 XWUID 图片目录；选择 gallery 使用远程图库接口。图库图片可能存在内容风险，请自行决定是否启用；使用风险自行承担，插件作者不承担责任',
+        '选择 local 使用本地 XWUID 图片目录；选择 gallery 使用远程图库接口。'
+        '图库图片可能存在内容风险，请自行决定是否启用；'
+        '使用风险自行承担，插件作者不承担责任',
         'local',
+        options=['local', 'gallery'],
+    ),
+    'DailyWifeNteImageSource': GsStrConfig(
+        '异环老婆图片数据源',
+        '选择 local 只使用本地图片目录，本地没有图片的角色会被跳过；'
+        '选择 gallery 在本地没有图片时使用 NTEUID 官方资源地址兜底。默认 gallery',
+        'gallery',
+        options=['local', 'gallery'],
+    ),
+    'DailyWifePgrImageSource': GsStrConfig(
+        '战双老婆图片数据源',
+        '选择 local 只使用本地战双图库目录；'
+        '选择 gallery 优先使用远程图库接口，接口不可用时回退本地。默认 gallery',
+        'gallery',
+        options=['local', 'gallery'],
+    ),
+    'DailyLoliImageSource': GsStrConfig(
+        '萝莉图片数据源',
+        '选择 local 只使用本地萝莉图库；'
+        '选择 gallery 优先使用远程图库接口，接口不可用时回退本地。默认 gallery',
+        'gallery',
         options=['local', 'gallery'],
     ),
     'DailyWifeCustomRolePilePath': GsStrConfig(
@@ -30,47 +53,62 @@ CONFIG_DEFAULT: Dict[str, GSC] = {
     ),
     'DailyWifeRoleMapPath': GsStrConfig(
         '角色 ID 对照表路径',
-        '留空时使用插件内置 wife_role_id_map.txt',
+        '留空时使用插件内置 role_id_map.json 的 wife 节',
         '',
     ),
     'DailyWifeWifeRoleMapPath': GsStrConfig(
         '老婆角色 ID 对照表路径',
-        '留空时回退旧配置项「角色 ID 对照表路径」，再回退插件内置 wife_role_id_map.txt',
+        '留空时回退旧配置项「角色 ID 对照表路径」，再回退插件内置 role_id_map.json 的 wife 节',
         '',
     ),
     'DailyWifeHusbandRoleMapPath': GsStrConfig(
         '老公角色 ID 对照表路径',
-        '留空时使用插件内置 husband_role_id_map.txt',
+        '留空时使用插件内置 role_id_map.json 的 husband 节',
         '',
     ),
-    'DailyWifeGalleryApiUrl': GsStrConfig(
-        '图库接口地址',
-        '图库角色立绘接口地址，默认使用 https://img.mimokit.dpdns.org/api/xwuid/roles。启用图库即表示已知晓图片内容风险并自行承担',
-        'https://img.mimokit.dpdns.org/api/xwuid/roles',
+    'DailyWifeApiUrl': GsStrConfig(
+        '图库接口统一地址',
+        '今日老婆全套图库接口统一地址，默认使用 https://twfapi.xlinxc.cn。包含鸣潮/普通老婆/萝莉/正太/战双全套图库。启用图库即表示已知晓图片内容风险并自行承担',
+        'https://twfapi.xlinxc.cn',
     ),
     'DailyWifeNormalEnabled': GsBoolConfig(
         '启用普通老婆',
         '开启后“今日老婆”指令使用普通老婆远程图库，文案使用“你的老婆来啦！”，并遵循今日老婆限制',
         False,
     ),
-    'DailyWifeNormalGalleryApiUrl': GsStrConfig(
-        '普通老婆图库地址',
-        '普通老婆远程图库接口地址，返回 roles[].role_ids/name/images[].url；访问时复用图库访问令牌',
-        'https://ceshi.mimokit.dpdns.org/api/ceshi/roles',
+    'DailyWifePrefetchEnabled': GsBoolConfig(
+        '零点前预热图库图片',
+        '每天 23:50 把候选角色图片预先下载到本地缓存，避免 0 点日期翻转后全员同时下载造成卡顿；'
+        '仅图库模式生效，限时限量且可被取消',
+        True,
     ),
-    'DailyWifeLoliApiUrl': GsStrConfig(
-        '今日萝莉接口地址',
-        'GET 返回与今日老婆同构的 JSON（roles[].role_ids/images[].url），留空则改用本地萝莉图库',
-        'https://loli.mimokit.dpdns.org',
+    'DailyWifeGalleryCacheMaxMB': GsIntConfig(
+        '图库缓存容量上限(MB)',
+        '本地图库图片缓存的总容量上限，超出后自动淘汰最旧的文件；设为 0 表示不限制',
+        512,
+        102400,
     ),
-    'DailyWifePgrGalleryApiUrl': GsStrConfig(
-        '战双图库接口地址',
-        'GET 返回战双角色图库 JSON；接口不可用时回退本地战双图库。',
-        'https://pgr.mimokit.dpdns.org/api/xwuid/roles',
+    'DailyWifeRecordRetentionDays': GsIntConfig(
+        '每日记录保留天数',
+        '超过该天数的每日老婆记录会被定期清理，避免数据表随天数无限增长；设为 0 表示永久保留',
+        30,
+        3650,
+    ),
+    'DailyWifePrefetchImagesPerRole': GsIntConfig(
+        '每个角色预热图片数',
+        '预热时每个角色最多下载几张图。数值越大命中率越高、占用带宽越多；设为 0 可只保留开关效果',
+        2,
+        20,
+    ),
+    'DailyWifeNormalTextTemplate': GsStrConfig(
+        '今日普通老婆文字模板',
+        '可用变量：{name} 角色名，{role_id} 作品名',
+        '你今天的老婆是来自{role_id}的{name}！',
     ),
     'DailyWifeGalleryToken': GsStrConfig(
         '图库访问令牌',
-        '图库接口启用令牌鉴权后必填。进 QQ 交流群 798949533 (https://qm.qq.com/q/pJVt8HNwrg) 获取；留空则不携带令牌',
+        '图库接口启用令牌鉴权后必填。进 QQ 交流群 798949533 '
+        '(https://qm.qq.com/q/pJVt8HNwrg) 获取并前往 https://twf.xlinxc.cn 申请；留空则不携带令牌',
         '',
     ),
     'DailyWifeImageUploadWhitelist': GsListStrConfig(
@@ -87,7 +125,7 @@ CONFIG_DEFAULT: Dict[str, GSC] = {
     ),
     'DailyWifeNteRoleMapPath': GsStrConfig(
         '异环角色 ID 对照表路径',
-        '留空时使用插件内置 nte_role_id_map.txt',
+        '留空时使用插件内置 role_id_map.json 的 nte 节',
         '',
     ),
     'DailyWifeNteCustomPanelPath': GsStrConfig(
@@ -137,6 +175,28 @@ CONFIG_DEFAULT: Dict[str, GSC] = {
         '开启后文字说明会额外附带一行"角色ID：xxx"',
         False,
     ),
+    'DailyWifeImageMaxSizeMB': GsIntConfig(
+        '角色图片最大体积(MB)',
+        (
+            '发送角色立绘/图库图片前自动压缩的最大体积上限（MB），超出时转为 WebP 压缩至该大小以内；'
+            '设为 0 表示不压缩。适用于 QQ 官方机器人等对图片体积有严格限制的协议端'
+        ),
+        2,
+        50,
+    ),
+    'DailyWifeSendRoleQuote': GsBoolConfig(
+        '发送角色剧情与对话台词',
+        '开启后抽取今日老婆时，在文字后附带角色剧情或对话台词',
+        False,
+    ),
+    'DailyWifeShowUserId': GsBoolConfig(
+        '显示触发者 ID',
+        (
+            '开启后文字说明额外附带一行“你的ID：xxx”，'
+            '方便 QQ 官方机器人等平台的群友复制 OpenID 进行抢老婆/送老婆'
+        ),
+        False,
+    ),
     'DailyWifeDebugMode': GsBoolConfig(
         '主人 Debug 模式',
         '开启后机器人主人每次抽取都会临时随机重抽，不读取或写入当天记录，便于调试',
@@ -144,6 +204,11 @@ CONFIG_DEFAULT: Dict[str, GSC] = {
     ),
 
     '_DividerAssignWife': GsDivider('分配老婆', ''),
+    'DailyWifeAssignWhitelist': GsListStrConfig(
+        '分配老婆白名单',
+        '允许使用分配老婆功能的用户 ID。机器人主人无需加入白名单；功能开关和权限可在“今日老婆-分配老婆”服务中配置',
+        [],
+    ),
     'DailyWifeSpecifyWhitelist': GsListStrConfig(
         '指定老婆白名单',
         '允许使用指定老婆功能的用户 ID。机器人主人无需加入白名单；功能开关和权限可在“今日老婆-指定老婆”服务中配置',
@@ -200,7 +265,19 @@ CONFIG_DEFAULT: Dict[str, GSC] = {
     'DailyLoliEnabled': GsBoolConfig(
         '启用今日萝莉',
         '开启后可使用「今日萝莉」命令；关闭后命令不生效。图片内容风险请自行承担',
-        False,
+        True,
+    ),
+
+    '_DividerDailyShota': GsDivider('今日正太', ''),
+    'DailyShotaEnabled': GsBoolConfig(
+        '启用今日正太',
+        '开启后可使用「今日正太」命令；关闭后命令不生效',
+        True,
+    ),
+    'DailyShotaTextTemplate': GsStrConfig(
+        '今日正太文字模板',
+        '今日正太的文字说明模板',
+        '你今天的正太来啦！',
     ),
 
     '_DividerRob': GsDivider('抢夺设置', ''),
@@ -244,6 +321,21 @@ CONFIG_DEFAULT: Dict[str, GSC] = {
         '可用变量：{name} 名称，{role_id} 图片标识，{target} 被抢用户 ID',
         '抢萝莉成功！你把对方今天的萝莉抢过来了！',
     ),
+    'DailyShotaRobEnabled': GsBoolConfig(
+        '启用抢正太',
+        '开启后可以使用"抢正太 @对方"抢对方当天正太',
+        True,
+    ),
+    'DailyShotaRobSuccessRate': GsStrConfig(
+        '抢正太成功率',
+        '0 到 1 之间的小数，例如 0.5 表示 50%',
+        '0.5',
+    ),
+    'DailyShotaRobSuccessTemplate': GsStrConfig(
+        '抢正太成功文案',
+        '可用变量：{name} 名称，{role_id} 图片标识，{target} 被抢用户 ID',
+        '抢正太成功！你把对方今天的正太抢过来了！',
+    ),
 
     '_DividerGift': GsDivider('赠送设置', ''),
     'DailyWifeGiftEnabled': GsBoolConfig(
@@ -275,6 +367,16 @@ CONFIG_DEFAULT: Dict[str, GSC] = {
         '送萝莉成功文案',
         '可用变量：{name} 名称，{role_id} 图片标识，{target} 接收用户 ID',
         '你把今天的萝莉送给了对方！',
+    ),
+    'DailyShotaGiftEnabled': GsBoolConfig(
+        '启用送正太',
+        '开启后可以使用“送正太 @对方”，对方发送“接受正太赠送”后完成赠送',
+        True,
+    ),
+    'DailyShotaGiftSuccessTemplate': GsStrConfig(
+        '送正太成功文案',
+        '可用变量：{name} 名称，{role_id} 图片标识，{target} 接收用户 ID',
+        '你把今天的正太送给了对方！',
     ),
 }
 

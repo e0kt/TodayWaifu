@@ -37,7 +37,7 @@
       {
         "name": "上传战双老婆图片",
         "desc": "上传图片到已存在的战双角色文件夹（主人或上传白名单）",
-        "eg": "上传战双老婆图片 露西亚 [图片]",
+        "eg": "上传战双老婆图片 露西亚",
         "need_ck": false,
         "need_sk": false,
         "need_admin": false
@@ -227,6 +227,59 @@
         "need_ck": false,
         "need_sk": false,
         "need_admin": true
+      }
+    ]
+  },
+  "今日正太": {
+    "desc": "随机正太图（远程图库）",
+    "data": [
+      {
+        "name": "今日正太",
+        "desc": "获取今日正太图，当天固定后可被抢/送",
+        "eg": "今日正太",
+        "need_ck": false,
+        "need_sk": false,
+        "need_admin": false
+      },
+      {
+        "name": "抢正太",
+        "desc": "有概率抢走对方今日正太",
+        "eg": "抢正太 @对方",
+        "need_ck": false,
+        "need_sk": false,
+        "need_admin": false
+      },
+      {
+        "name": "送正太",
+        "desc": "把今日正太送给对方",
+        "eg": "送正太 @对方",
+        "need_ck": false,
+        "need_sk": false,
+        "need_admin": false
+      },
+      {
+        "name": "接受正太赠送",
+        "desc": "同意接受对方送来的正太",
+        "eg": "接受正太赠送",
+        "need_ck": false,
+        "need_sk": false,
+        "need_admin": false
+      },
+      {
+        "name": "拒绝正太赠送",
+        "desc": "拒绝对方的送正太请求",
+        "eg": "拒绝正太赠送",
+        "need_ck": false,
+        "need_sk": false,
+        "need_admin": false
+      },
+      {
+        "name": "正太离婚",
+        "desc": "主动放弃今天的正太",
+        "eg": "正太离婚",
+        "need_ck": false,
+        "need_sk": false,
+        "need_admin": false
       }
     ]
   },

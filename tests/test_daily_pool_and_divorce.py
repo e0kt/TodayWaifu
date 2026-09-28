@@ -1,8 +1,8 @@
 import ast
+import json
 import unittest
-from pathlib import Path
 from typing import Any
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -28,11 +28,8 @@ def _extract_function(path: Path, name: str, globals_dict: dict[str, Any]):
 
 class NteRosterTests(unittest.TestCase):
     def test_builtin_nte_map_contains_all_current_non_protagonist_women(self) -> None:
-        names = {
-            line.split('：', 1)[1].strip()
-            for line in (ROOT / 'nte_role_id_map.txt').read_text(encoding='utf-8-sig').splitlines()
-            if '：' in line
-        }
+        role_map = json.loads((ROOT / 'role_id_map.json').read_text(encoding='utf-8'))
+        names = set(role_map['nte'].values())
         self.assertEqual(
             names,
             {
@@ -54,9 +51,9 @@ class NteRosterTests(unittest.TestCase):
         )
 
     def test_nte_filter_rejects_men_and_both_protagonists(self) -> None:
-        shared_path = ROOT / 'twf' / 'shared.py'
+        roles_path = ROOT / 'TodayWaifu' / 'roles.py'
         is_excluded = _extract_function(
-            shared_path,
+            roles_path,
             '_is_excluded_nte_role',
             {
                 '_normalize_role_name': lambda name: name.replace('・', '·').strip(),
@@ -83,7 +80,7 @@ class NteRosterTests(unittest.TestCase):
         for name in ('早雾', '安魂曲', '伊洛伊', '真红'):
             self.assertFalse(is_excluded(name), name)
 
-        source = shared_path.read_text(encoding='utf-8-sig')
+        source = roles_path.read_text(encoding='utf-8-sig')
         self.assertIn('if not _is_excluded_nte_role(role_name)', source)
 
 
@@ -97,7 +94,7 @@ class UnifiedDivorceTests(unittest.TestCase):
             'loli': 'lolis',
         }
         return _extract_function(
-            ROOT / 'twf' / 'shared.py',
+            ROOT / 'TodayWaifu' / 'daily_store.py',
             '_mark_all_daily_records_divorced',
             {
                 'Any': Any,
@@ -148,7 +145,7 @@ class UnifiedDivorceTests(unittest.TestCase):
 
     def test_divorced_state_takes_precedence_over_old_transfer_flags(self) -> None:
         wife_state = _extract_function(
-            ROOT / 'twf' / 'shared.py',
+            ROOT / 'TodayWaifu' / 'daily_store.py',
             '_wife_state',
             {'Any': Any},
         )
@@ -167,7 +164,7 @@ class UnifiedDivorceTests(unittest.TestCase):
 
     def test_loli_divorce_result_hides_internal_image_id(self) -> None:
         result_name = _extract_function(
-            ROOT / 'twf' / 'divorce.py',
+            ROOT / 'TodayWaifu' / 'divorce.py',
             '_divorce_result_name',
             {},
         )

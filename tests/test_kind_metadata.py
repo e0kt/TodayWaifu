@@ -1,11 +1,10 @@
-import importlib.util
 import sys
 import unittest
+import importlib.util
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
-MODULE_PATH = ROOT / "twf" / "kind_metadata.py"
+MODULE_PATH = ROOT / "TodayWaifu" / "kind_metadata.py"
 
 
 def _load_module():
@@ -21,14 +20,20 @@ def _load_module():
 class DailyKindMetadataTests(unittest.TestCase):
     def test_known_kinds_have_centralized_metadata(self) -> None:
         kinds = _load_module()
-        self.assertEqual(set(kinds.DAILY_KIND_METADATA), {"wife", "husband", "loli", "nte", "pgr"})
+        self.assertEqual(set(kinds.DAILY_KIND_METADATA), {"wife", "husband", "loli", "shota", "nte", "pgr", "normal"})
         self.assertEqual(kinds.daily_kind_metadata("wife").bucket, "wives")
         self.assertEqual(kinds.daily_kind_metadata("husband").title, "老公")
         self.assertEqual(kinds.daily_kind_metadata("loli").rob_enabled_key, "DailyLoliRobEnabled")
+        self.assertEqual(kinds.daily_kind_metadata("shota").bucket, "shotas")
+        self.assertEqual(kinds.daily_kind_metadata("shota").title, "正太")
+        self.assertEqual(kinds.daily_kind_metadata("shota").text_template_default, "你今天的正太来啦！")
         self.assertEqual(kinds.daily_kind_metadata("nte").bucket, "nte_wives")
         self.assertEqual(kinds.daily_kind_metadata("nte").role_mode, "nte")
         self.assertEqual(kinds.daily_kind_metadata("pgr").bucket, "pgr_wives")
         self.assertEqual(kinds.daily_kind_metadata("pgr").text_template_key, "DailyWifePgrTextTemplate")
+        self.assertEqual(kinds.daily_kind_metadata("normal").bucket, "normal_wives")
+        self.assertEqual(kinds.daily_kind_metadata("normal").role_mode, "normal")
+        self.assertEqual(kinds.daily_kind_metadata("normal").text_template_key, "DailyWifeNormalTextTemplate")
         self.assertEqual(
             kinds.daily_kind_metadata("husband").gift_success_default,
             "你把今天的老公{name}送给了对方！",
@@ -45,6 +50,11 @@ class DailyKindMetadataTests(unittest.TestCase):
         self.assertEqual(loli.rob_success_default, "抢萝莉成功！你把对方今天的萝莉抢过来了！")
         self.assertEqual(loli.gift_enabled_key, "DailyLoliGiftEnabled")
         self.assertEqual(loli.gift_success_key, "DailyLoliGiftSuccessTemplate")
+        shota = kinds.daily_kind_metadata("shota")
+        self.assertEqual(shota.rob_enabled_key, "DailyShotaRobEnabled")
+        self.assertEqual(shota.gift_enabled_key, "DailyShotaGiftEnabled")
+        self.assertEqual(shota.rob_success_default, "抢正太成功！你把对方今天的正太抢过来了！")
+        self.assertEqual(shota.gift_success_default, "你把今天的正太送给了对方！")
 
 
 if __name__ == "__main__":

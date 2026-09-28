@@ -2,19 +2,19 @@ import ast
 import unittest
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class PgrFeatureSourceTests(unittest.TestCase):
     def test_pgr_config_and_command_are_registered(self) -> None:
         config = (ROOT / 'config_default.py').read_text(encoding='utf-8-sig')
-        source = (ROOT / 'twf' / 'pgr.py').read_text(encoding='utf-8-sig')
+        source = (ROOT / 'TodayWaifu' / 'pgr.py').read_text(encoding='utf-8-sig')
         tree = ast.parse(source)
 
         self.assertIn("'DailyWifePgrEnabled'", config)
         self.assertIn("'DailyWifePgrGalleryPath'", config)
-        self.assertIn("'DailyWifePgrGalleryApiUrl'", config)
+        # 战双图库地址已并入统一的 DailyWifeApiUrl
+        self.assertIn("'DailyWifeApiUrl'", config)
         self.assertIn("'DailyWifePgrTextTemplate'", config)
         self.assertIn("'DailyWifeImageUploadWhitelist'", config)
         self.assertTrue(
@@ -35,22 +35,23 @@ class PgrFeatureSourceTests(unittest.TestCase):
         self.assertIn("('上传战双老婆图片', '战双老婆上传图片')", source)
 
     def test_pgr_remote_gallery_is_used_with_local_fallback(self) -> None:
-        shared = (ROOT / 'twf' / 'shared.py').read_text(encoding='utf-8-sig')
-        source = (ROOT / 'twf' / 'pgr.py').read_text(encoding='utf-8-sig')
+        gallery = (ROOT / 'TodayWaifu' / 'gallery.py').read_text(encoding='utf-8-sig')
+        source = (ROOT / 'TodayWaifu' / 'pgr.py').read_text(encoding='utf-8-sig')
 
-        self.assertIn('async def _load_pgr_wife_candidates()', shared)
-        self.assertIn("_cfg('DailyWifePgrGalleryApiUrl')", shared)
-        self.assertIn('_parse_pgr_gallery_candidates(payload)', shared)
-        self.assertIn('return await asyncio.to_thread(_load_pgr_local_candidates)', shared)
+        self.assertIn('async def _load_pgr_wife_candidates()', gallery)
+        # 战双图库地址已并入统一的 DailyWifeApiUrl，旧键 DailyWifePgrGalleryApiUrl 已删除
+        self.assertIn("_cfg('DailyWifeApiUrl')", gallery)
+        self.assertIn('_parse_pgr_gallery_candidates(payload)', gallery)
+        self.assertIn('return await run_blocking(_load_pgr_local_candidates)', gallery)
         self.assertIn('await _load_pgr_wife_candidates()', source)
         self.assertIn("record.image.startswith(('http://', 'https://'))", source)
         self.assertIn('await _send_role_image(', source)
 
     def test_all_image_uploads_share_global_whitelist(self) -> None:
-        shared = (ROOT / 'twf' / 'shared.py').read_text(encoding='utf-8-sig')
-        custom = (ROOT / 'twf' / 'custom_role.py').read_text(encoding='utf-8-sig')
-        loli = (ROOT / 'twf' / 'loli.py').read_text(encoding='utf-8-sig')
-        pgr = (ROOT / 'twf' / 'pgr.py').read_text(encoding='utf-8-sig')
+        shared = (ROOT / 'TodayWaifu' / 'shared.py').read_text(encoding='utf-8-sig')
+        custom = (ROOT / 'TodayWaifu' / 'custom_role.py').read_text(encoding='utf-8-sig')
+        loli = (ROOT / 'TodayWaifu' / 'loli.py').read_text(encoding='utf-8-sig')
+        pgr = (ROOT / 'TodayWaifu' / 'pgr.py').read_text(encoding='utf-8-sig')
 
         self.assertIn("image_upload_sv = SV('今日老婆-图片上传'", shared)
         self.assertIn("_cfg('DailyWifeImageUploadWhitelist')", shared)
@@ -59,16 +60,19 @@ class PgrFeatureSourceTests(unittest.TestCase):
             self.assertIn('@image_upload_sv.', source)
 
     def test_pgr_upload_requires_existing_role_directory(self) -> None:
-        source = (ROOT / 'twf' / 'pgr.py').read_text(encoding='utf-8-sig')
+        source = (ROOT / 'TodayWaifu' / 'pgr.py').read_text(encoding='utf-8-sig')
 
         self.assertIn('find_named_role_directory(_pgr_wife_root(), role_name)', source)
         self.assertIn('不存在角色文件夹', source)
         self.assertNotIn('role_dir.mkdir(', source)
 
     def test_pgr_uses_independent_daily_bucket_and_configurable_gallery(self) -> None:
-        shared = (ROOT / 'twf' / 'shared.py').read_text(encoding='utf-8-sig')
-        metadata = (ROOT / 'twf' / 'kind_metadata.py').read_text(encoding='utf-8-sig')
-        source = (ROOT / 'twf' / 'pgr.py').read_text(encoding='utf-8-sig')
+        # shared 已按职责拆分，故扫描整个 TodayWaifu 包而非单文件。
+        shared = '\n'.join(
+            path.read_text(encoding='utf-8-sig') for path in sorted((ROOT / 'TodayWaifu').glob('*.py'))
+        )
+        metadata = (ROOT / 'TodayWaifu' / 'kind_metadata.py').read_text(encoding='utf-8-sig')
+        source = (ROOT / 'TodayWaifu' / 'pgr.py').read_text(encoding='utf-8-sig')
 
         self.assertIn("context.setdefault('pgr_wives', {})", shared)
         self.assertIn('bucket="pgr_wives"', metadata)
@@ -81,16 +85,18 @@ class PgrFeatureSourceTests(unittest.TestCase):
         self.assertIn('不要贪心！', source)
 
     def test_daily_wife_variants_share_an_exclusive_daily_choice(self) -> None:
-        shared = (ROOT / 'twf' / 'shared.py').read_text(encoding='utf-8-sig')
-        daily = (ROOT / 'twf' / 'daily.py').read_text(encoding='utf-8-sig')
+        shared = '\n'.join(
+            path.read_text(encoding='utf-8-sig') for path in sorted((ROOT / 'TodayWaifu').glob('*.py'))
+        )
+        daily = (ROOT / 'TodayWaifu' / 'daily.py').read_text(encoding='utf-8-sig')
 
         self.assertIn("DAILY_WIFE_KINDS = ('wife', 'nte', 'pgr')", shared)
         self.assertIn('_get_other_daily_wife_name(ev, mode)', daily)
         self.assertIn('不要贪心！', daily)
 
     def test_owner_debug_mode_bypasses_shared_daily_choice(self) -> None:
-        daily_source = (ROOT / 'twf' / 'daily.py').read_text(encoding='utf-8-sig')
-        pgr_source = (ROOT / 'twf' / 'pgr.py').read_text(encoding='utf-8-sig')
+        daily_source = (ROOT / 'TodayWaifu' / 'daily.py').read_text(encoding='utf-8-sig')
+        pgr_source = (ROOT / 'TodayWaifu' / 'pgr.py').read_text(encoding='utf-8-sig')
 
         daily_function = ast.get_source_segment(
             daily_source,
@@ -119,9 +125,9 @@ class PgrFeatureSourceTests(unittest.TestCase):
 
     def test_role_selection_has_independent_sv_and_whitelist(self) -> None:
         config = (ROOT / 'config_default.py').read_text(encoding='utf-8-sig')
-        shared = (ROOT / 'twf' / 'shared.py').read_text(encoding='utf-8-sig')
-        daily = (ROOT / 'twf' / 'daily.py').read_text(encoding='utf-8-sig')
-        pgr = (ROOT / 'twf' / 'pgr.py').read_text(encoding='utf-8-sig')
+        shared = (ROOT / 'TodayWaifu' / 'shared.py').read_text(encoding='utf-8-sig')
+        daily = (ROOT / 'TodayWaifu' / 'daily.py').read_text(encoding='utf-8-sig')
+        pgr = (ROOT / 'TodayWaifu' / 'pgr.py').read_text(encoding='utf-8-sig')
 
         self.assertIn("'_DividerAssignWife': GsDivider('分配老婆', '')", config)
         self.assertIn("'DailyWifeSpecifyWhitelist'", config)
@@ -137,7 +143,7 @@ class PgrFeatureSourceTests(unittest.TestCase):
         self.assertIn('@specify_wife_sv.on_prefix(', pgr)
 
     def test_pgr_owner_debug_draw_is_random_and_not_persisted(self) -> None:
-        source = (ROOT / 'twf' / 'pgr.py').read_text(encoding='utf-8-sig')
+        source = (ROOT / 'TodayWaifu' / 'pgr.py').read_text(encoding='utf-8-sig')
         function = ast.get_source_segment(
             source,
             next(
@@ -160,7 +166,7 @@ class PgrFeatureSourceTests(unittest.TestCase):
         )
 
     def test_pgr_prefix_passes_specified_name(self) -> None:
-        source = (ROOT / 'twf' / 'pgr.py').read_text(encoding='utf-8-sig')
+        source = (ROOT / 'TodayWaifu' / 'pgr.py').read_text(encoding='utf-8-sig')
         function = ast.get_source_segment(
             source,
             next(
@@ -174,7 +180,7 @@ class PgrFeatureSourceTests(unittest.TestCase):
         self.assertIn("str(ev.text or '').strip()", function)
 
     def test_pgr_specified_name_uses_normalized_exact_match(self) -> None:
-        source = (ROOT / 'twf' / 'pgr.py').read_text(encoding='utf-8-sig')
+        source = (ROOT / 'TodayWaifu' / 'pgr.py').read_text(encoding='utf-8-sig')
         function = ast.get_source_segment(
             source,
             next(

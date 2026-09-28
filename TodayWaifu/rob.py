@@ -1,0 +1,301 @@
+"""TodayWaifu rob command."""
+from __future__ import annotations
+
+import random
+
+from .shared import (
+    LOG_PREFIX,
+    Bot,
+    Event,
+    RoleCandidate,
+    _cfg,
+    logger,
+    rob_sv,
+    _cfg_bool,
+    _user_key,
+    _is_master,
+    _safe_send,
+    _wife_state,
+    _record_to_dict,
+    _cfg_probability,
+    _has_active_wife,
+    _daily_item_title,
+    _daily_bucket_name,
+    _husband_available,
+    _user_display_name,
+    _daily_context_lock,
+    _is_secondhand_wife,
+    _load_daily_context,
+    _save_daily_records,
+    _daily_kind_metadata,
+    _send_daily_result_image,
+    _get_event_target_user_id,
+    _get_existing_daily_record,
+)
+from .payloads import RoleRecordValue
+
+
+def _rob_enabled(kind: str) -> bool:
+    return _cfg_bool(_daily_kind_metadata(kind).rob_enabled_key, True)
+
+
+def _rob_success_rate(kind: str) -> float:
+    metadata = _daily_kind_metadata(kind)
+    return _cfg_probability(metadata.rob_success_rate_key, 0.5)
+
+
+def _rob_success_template(kind: str) -> str:
+    metadata = _daily_kind_metadata(kind)
+    return str(_cfg(metadata.rob_success_key) or metadata.rob_success_default)
+
+
+def _build_rob_success_text(role: RoleCandidate, target_user_id: str, kind: str) -> str:
+    template = _rob_success_template(kind)
+    return template.format(
+        name=role.name,
+        role_id='/'.join(role.role_ids),
+        target=target_user_id,
+    )
+
+
+def _rob_attempt_key(kind: str, user_id: str) -> str:
+    return user_id if kind == 'wife' else f'{kind}:{user_id}'
+
+
+async def _send_rob_result_image(
+    bot: Bot,
+    role: RoleCandidate,
+    image: str,
+    text: str,
+    user_id: str,
+    is_group: bool,
+    kind: str,
+) -> None:
+    await _send_daily_result_image(bot, role, image, text, user_id, is_group, kind)
+
+
+async def _send_rob_daily(bot: Bot, ev: Event, kind: str = 'wife') -> None:
+    title = _daily_item_title(kind)
+    if kind == 'husband' and not _husband_available():
+        return
+    if not _rob_enabled(kind):
+        return
+    logger.info(f'{LOG_PREFIX} 用户 {ev.user_id} 在群 {ev.group_id or "direct"} 发起抢{title}')
+
+    target_user_id = _get_event_target_user_id(ev)
+    if not target_user_id:
+        return await _safe_send(
+            bot,
+            f'要抢谁的{title}？请艾特对方，或在命令后面写对方 QQ。\n'
+            'QQ 官方机器人等没有 QQ 号的平台，可直接粘贴对方的用户 ID。',
+        )
+
+    robber_id = _user_key(ev)
+    if target_user_id == robber_id:
+        return await _safe_send(bot, f'自己抢自己的{title}也太奇怪了吧！')
+
+    target_record = await _get_existing_daily_record(ev, target_user_id, kind)
+    if target_record is None:
+        return await _safe_send(bot, f'对方今天还没有{title}呢~')
+
+    # 读-改-写全程持锁：校验、记次数、转移归属、落库串行执行，替代旧的"无 await"原子段
+    refusal: str | None = None
+    rob_failed = False
+    updates: list[tuple[str, str, RoleRecordValue | bool | None]] = []
+    async with _daily_context_lock(ev):
+        context = await _load_daily_context(ev)
+        bucket = _daily_bucket_name(kind)
+        target_key = _user_key(ev, target_user_id)
+        target_data = context[bucket].get(target_key)
+
+        if _wife_state(target_data) != 'owned':
+            refusal = f'对方的{title}已经不在身边了，抢不到了哦~'
+        elif _is_secondhand_wife(target_data):
+            refusal = f'对方这个{title}是抢来或别人送的，抢不动哦~'
+        elif not _has_active_wife(target_data):
+            refusal = f'对方今天还没有{title}呢~'
+
+        if refusal is None:
+            robber_data = context[bucket].get(robber_id)
+            if _has_active_wife(robber_data):
+                refusal = f'你今天已经有{title}了，先离婚再抢吧~'
+
+        if refusal is None:
+            attempts = context.setdefault('rob_attempts', {})
+            is_master = _is_master(ev)
+            attempt_key = _rob_attempt_key(kind, robber_id)
+            if not is_master and (attempts.get(attempt_key) or (kind == 'wife' and attempts.get(robber_id))):
+                logger.info(f'{LOG_PREFIX} 用户 {robber_id} 今天抢{title}次数已用尽')
+                refusal = f'今天已经抢过{title}啦，明天再来吧！'
+
+        if refusal is None:
+            if not is_master:
+                updates.append(('rob_attempts', attempt_key, True))
+            if random.random() >= _rob_success_rate(kind):
+                logger.info(f'{LOG_PREFIX} 用户 {robber_id} 抢 {target_user_id} 的{title}失败')
+                rob_failed = True
+            else:
+                logger.info(f'{LOG_PREFIX} 用户 {robber_id} 成功抢走 {target_user_id} 的{title}')
+                robbed_record = _record_to_dict(target_record, ev, robber_id)
+                robbed_record['stolen_from'] = target_user_id
+                updates.append((bucket, robber_id, robbed_record))
+                target_update = context[bucket].get(target_key)
+                if isinstance(target_update, dict):
+                    target_update = dict(target_update)
+                    target_update['stolen_by'] = robber_id
+                    target_update['stolen_by_name'] = _user_display_name(ev, robber_id)
+                    updates.append((bucket, target_key, target_update))
+
+            await _save_daily_records(ev, updates)
+
+    if refusal is not None:
+        return await _safe_send(bot, refusal)
+    if rob_failed:
+        return await _safe_send(bot, f'这次没抢到{title}，下次再试试吧~')
+
+    role = target_record.to_role()
+    await _send_rob_result_image(
+        bot,
+        role,
+        target_record.image,
+        _build_rob_success_text(role, target_user_id, kind),
+        robber_id,
+        ev.group_id is not None,
+        kind,
+    )
+
+
+async def _send_rob_wife(bot: Bot, ev: Event) -> None:
+    await _send_rob_daily(bot, ev, 'wife')
+
+
+async def _send_rob_husband(bot: Bot, ev: Event) -> None:
+    await _send_rob_daily(bot, ev, 'husband')
+
+
+async def _send_rob_loli(bot: Bot, ev: Event) -> None:
+    await _send_rob_daily(bot, ev, 'loli')
+
+
+async def _send_rob_shota(bot: Bot, ev: Event) -> None:
+    await _send_rob_daily(bot, ev, 'shota')
+
+
+@rob_sv.on_prefix(
+    ('抢老婆', '抢今日老婆', '抢婆娘'),
+    block=True,
+    to_ai="""抢夺指定用户今天的老婆。
+    当用户说“抢某人的老婆”“抢老婆 @某人”时调用。
+    Args:
+        text: 目标用户，通常是 @用户 或用户 ID。
+    """,
+    covers=['抢夺他人今日老婆，按概率判定成败'],
+    aliases=['今日老婆·抢老婆', '今日老婆·抢婆娘'],
+)
+async def rob_wife(bot: Bot, ev: Event) -> None:
+    await _send_rob_wife(bot, ev)
+
+
+@rob_sv.on_fullmatch(
+    ('抢老婆', '抢今日老婆', '抢婆娘'),
+    block=True,
+    to_ai="""显示抢老婆的用法。
+    当用户只说“抢老婆”但没有指定目标用户时调用。
+    Args:
+        text: 无需参数，留空。
+    """,
+    covers=['抢夺他人今日老婆，按概率判定成败'],
+    aliases=['今日老婆·抢老婆', '今日老婆·抢婆娘'],
+)
+async def rob_wife_at(bot: Bot, ev: Event) -> None:
+    await _send_rob_wife(bot, ev)
+
+
+@rob_sv.on_prefix(
+    ('抢老公', '抢今日老公'),
+    block=True,
+    to_ai="""抢夺指定用户今天的老公。
+    当用户说“抢某人的老公”“抢老公 @某人”时调用。
+    Args:
+        text: 目标用户，通常是 @用户 或用户 ID。
+    """,
+    covers=['抢夺他人今日老公，按概率判定成败'],
+    aliases=['今日老婆·抢老公'],
+)
+async def rob_husband(bot: Bot, ev: Event) -> None:
+    await _send_rob_husband(bot, ev)
+
+
+@rob_sv.on_fullmatch(
+    ('抢老公', '抢今日老公'),
+    block=True,
+    to_ai="""显示抢老公的用法。
+    当用户只说“抢老公”但没有指定目标用户时调用。
+    Args:
+        text: 无需参数，留空。
+    """,
+    covers=['抢夺他人今日老公，按概率判定成败'],
+    aliases=['今日老婆·抢老公'],
+)
+async def rob_husband_at(bot: Bot, ev: Event) -> None:
+    await _send_rob_husband(bot, ev)
+
+
+@rob_sv.on_prefix(
+    ('抢萝莉', '抢今日萝莉'),
+    block=True,
+    to_ai="""抢夺指定用户今天的萝莉。
+    当用户说“抢某人的萝莉”“抢萝莉 @某人”时调用。
+    Args:
+        text: 目标用户，通常是 @用户 或用户 ID。
+    """,
+    covers=['抢夺他人今日萝莉，按概率判定成败'],
+    aliases=['今日老婆·抢萝莉'],
+)
+async def rob_loli(bot: Bot, ev: Event) -> None:
+    await _send_rob_loli(bot, ev)
+
+
+@rob_sv.on_fullmatch(
+    ('抢萝莉', '抢今日萝莉'),
+    block=True,
+    to_ai="""显示抢萝莉的用法。
+    当用户只说“抢萝莉”但没有指定目标用户时调用。
+    Args:
+        text: 无需参数，留空。
+    """,
+    covers=['抢夺他人今日萝莉，按概率判定成败'],
+    aliases=['今日老婆·抢萝莉'],
+)
+async def rob_loli_at(bot: Bot, ev: Event) -> None:
+    await _send_rob_loli(bot, ev)
+
+
+@rob_sv.on_prefix(
+    ('抢正太', '抢今日正太'),
+    block=True,
+    to_ai="""抢夺指定用户今天的正太。
+    当用户说“抢某人的正太”“抢正太 @某人”时调用。
+    Args:
+        text: 目标用户，通常是 @用户 或用户 ID。
+    """,
+    covers=['抢夺他人今日正太，按概率判定成败'],
+    aliases=['今日老婆·抢正太'],
+)
+async def rob_shota(bot: Bot, ev: Event) -> None:
+    await _send_rob_shota(bot, ev)
+
+
+@rob_sv.on_fullmatch(
+    ('抢正太', '抢今日正太'),
+    block=True,
+    to_ai="""显示抢正太的用法。
+    当用户只说“抢正太”但没有指定目标用户时调用。
+    Args:
+        text: 无需参数，留空。
+    """,
+    covers=['抢夺他人今日正太，按概率判定成败'],
+    aliases=['今日老婆·抢正太'],
+)
+async def rob_shota_at(bot: Bot, ev: Event) -> None:
+    await _send_rob_shota(bot, ev)

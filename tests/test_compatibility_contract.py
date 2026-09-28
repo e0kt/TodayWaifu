@@ -3,7 +3,6 @@ import json
 import unittest
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = json.loads((ROOT / "tests" / "compatibility_manifest.json").read_text(encoding="utf-8"))
 
@@ -28,7 +27,7 @@ def _config_manifest() -> dict[str, list[dict[str, str]]]:
 
 def _trigger_manifest() -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
-    for path in sorted((ROOT / "twf").glob("*.py")):
+    for path in sorted((ROOT / "TodayWaifu").glob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8-sig"))
         for node in tree.body:
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -59,23 +58,27 @@ class CompatibilityContractTests(unittest.TestCase):
             self.assertTrue((ROOT / relative).exists(), relative)
 
     def test_plugin_loading_order_remains_compatible(self) -> None:
-        source = (ROOT / "__init__.py").read_text(encoding="utf-8-sig")
+        source = (ROOT / "TodayWaifu" / "__init__.py").read_text(encoding="utf-8-sig")
         modules = ["shared", "help", "normal_wife", "daily", "rob", "gift", "divorce", "loli", "custom_role"]
-        positions = [source.index(f"from .twf import {name}") for name in modules]
+        positions = [source.index(f"from . import {name}") for name in modules]
         self.assertEqual(positions, sorted(positions))
 
     def test_runtime_data_paths_remain_compatible(self) -> None:
-        shared = (ROOT / "twf" / "shared.py").read_text(encoding="utf-8-sig")
+        # shared 已按职责拆分，路径常量散落在 paths/constants 等模块，故扫描整个 TodayWaifu 包。
+        twf_source = "\n".join(
+            path.read_text(encoding="utf-8-sig") for path in sorted((ROOT / "TodayWaifu").glob("*.py"))
+        )
         config = (ROOT / "daily_wife_config.py").read_text(encoding="utf-8-sig")
         for text in (
             "get_res_path('TodayWaifu')",
             "daily_wife_data.json",
+            "custom_role_map.json",
             "custom_role_map.txt",
             "custom_role_pile",
             "loli_images",
             "group_member_avatar_cache",
         ):
-            self.assertIn(text, shared + config)
+            self.assertIn(text, twf_source + config)
 
 
 if __name__ == "__main__":

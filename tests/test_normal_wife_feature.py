@@ -1,16 +1,23 @@
 import ast
 import asyncio
 import unittest
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, patch
-
+from pathlib import Path
+from dataclasses import dataclass
 
 ROOT = Path(__file__).resolve().parents[1]
-DAILY_PATH = ROOT / 'twf' / 'daily.py'
-SHARED_PATH = ROOT / 'twf' / 'shared.py'
-NORMAL_WIFE_PATH = ROOT / 'twf' / 'normal_wife.py'
+DAILY_PATH = ROOT / 'TodayWaifu' / 'daily.py'
+NORMAL_WIFE_PATH = ROOT / 'TodayWaifu' / 'normal_wife.py'
+
+
+def _module_defining(name: str) -> Path:
+    """定位定义 name 的 TodayWaifu 模块（shared 已按职责拆分）。"""
+    for path in sorted((ROOT / 'TodayWaifu').glob('*.py')):
+        tree = ast.parse(path.read_text(encoding='utf-8-sig'))
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+                return path
+    raise AssertionError(f'{name} 未在任何 TodayWaifu 模块中定义')
 
 
 def _extract_function(path: Path, name: str, globals_dict: dict[str, Any]):
@@ -71,6 +78,36 @@ class NormalWifeFeatureTests(unittest.IsolatedAsyncioTestCase):
         text = build_text(role, mode='wife')
         self.assertEqual(text, '你的老婆来啦！')
 
+    def test_build_text_normal_mode_with_work(self) -> None:
+        globals_dict = {
+            'RoleCandidate': _FakeRoleCandidate,
+            '_cfg_bool': lambda key, default=False: False,
+            '_daily_kind_metadata': lambda mode: _FakeKindMetadata(
+                text_template_key='DailyWifeNormalTextTemplate',
+                text_template_default='你今天的老婆是来自{role_id}的{name}！',
+            ),
+            '_cfg': lambda key: None,
+        }
+        build_text = _extract_function(DAILY_PATH, '_build_text', globals_dict)
+        role = _FakeRoleCandidate('雷电将军', ('原神', '原神!雷电将军'), ('https://example.test/raiden.png',))
+        text = build_text(role, mode='normal')
+        self.assertEqual(text, '你今天的老婆是来自原神的雷电将军！')
+
+    def test_build_text_normal_mode_without_work(self) -> None:
+        globals_dict = {
+            'RoleCandidate': _FakeRoleCandidate,
+            '_cfg_bool': lambda key, default=False: False,
+            '_daily_kind_metadata': lambda mode: _FakeKindMetadata(
+                text_template_key='DailyWifeNormalTextTemplate',
+                text_template_default='你今天的老婆是来自{role_id}的{name}！',
+            ),
+            '_cfg': lambda key: None,
+        }
+        build_text = _extract_function(DAILY_PATH, '_build_text', globals_dict)
+        role = _FakeRoleCandidate('初音未来', ('初音未来',), ('https://example.test/miku.png',))
+        text = build_text(role, mode='normal')
+        self.assertEqual(text, '你今天的老婆是初音未来！')
+
     def test_filter_by_mode_preserves_candidates_when_normal_wife_enabled(self) -> None:
         globals_dict = {
             'RoleCandidate': _FakeRoleCandidate,
@@ -80,7 +117,7 @@ class NormalWifeFeatureTests(unittest.IsolatedAsyncioTestCase):
             '_load_custom_upload_role_map': lambda: {},
             '_normalize_role_name': lambda name: name,
         }
-        filter_by_mode = _extract_function(SHARED_PATH, '_filter_by_mode', globals_dict)
+        filter_by_mode = _extract_function(_module_defining('_filter_by_mode'), '_filter_by_mode', globals_dict)
         role = _FakeRoleCandidate('未知角色', ('unknown_id',), ('https://example.test/pic.png',))
         candidates = (role,)
         filtered = filter_by_mode(candidates, mode='wife')
@@ -95,22 +132,25 @@ class NormalWifeFeatureTests(unittest.IsolatedAsyncioTestCase):
             '_load_custom_upload_role_map': lambda: {},
             '_normalize_role_name': lambda name: name,
         }
-        filter_by_mode = _extract_function(SHARED_PATH, '_filter_by_mode', globals_dict)
+        filter_by_mode = _extract_function(_module_defining('_filter_by_mode'), '_filter_by_mode', globals_dict)
         role1 = _FakeRoleCandidate('秧秧', ('1201',), ('https://example.test/1.png',))
         role2 = _FakeRoleCandidate('未知角色', ('9999',), ('https://example.test/2.png',))
         filtered = filter_by_mode((role1, role2), mode='wife')
         self.assertEqual(filtered, (role1,))
 
     def test_normal_gallery_api_url_default(self) -> None:
+        # 配置项已合并为统一的 DailyWifeApiUrl，默认地址取自 DEFAULT_GALLERY_BASE_URL
         globals_dict = {
             '_cfg': lambda key: '',
+            'DEFAULT_GALLERY_BASE_URL': 'https://twfapi.xlinxc.cn',
         }
         get_url = _extract_function(NORMAL_WIFE_PATH, '_normal_gallery_api_url', globals_dict)
-        self.assertEqual(get_url(), 'https://ceshi.mimokit.dpdns.org/api/ceshi/roles')
+        self.assertEqual(get_url(), 'https://twfapi.xlinxc.cn/api/ceshi/roles')
 
     def test_normal_gallery_api_url_custom(self) -> None:
         globals_dict = {
-            '_cfg': lambda key: 'https://custom.api.test/roles' if key == 'DailyWifeNormalGalleryApiUrl' else '',
+            '_cfg': lambda key: 'https://custom.api.test/roles' if key == 'DailyWifeApiUrl' else '',
+            'DEFAULT_GALLERY_BASE_URL': 'https://twfapi.xlinxc.cn',
         }
         get_url = _extract_function(NORMAL_WIFE_PATH, '_normal_gallery_api_url', globals_dict)
         self.assertEqual(get_url(), 'https://custom.api.test/roles')
@@ -126,6 +166,10 @@ class NormalWifeFeatureTests(unittest.IsolatedAsyncioTestCase):
         fake_time = MagicMock()
         fake_time.time.return_value = 1000.0
 
+        async def fake_run_blocking(func, *args):
+            # 测试里不需要真的线程池，直接同步执行，保持原有语义
+            return func(*args)
+
         globals_dict = {
             'RoleCandidate': _FakeRoleCandidate,
             'CANDIDATE_CACHE': {},
@@ -134,7 +178,8 @@ class NormalWifeFeatureTests(unittest.IsolatedAsyncioTestCase):
             'logger': fake_logger,
             'time': fake_time,
             'asyncio': asyncio,
-            '_image_source': lambda: 'gallery',
+            'run_blocking': fake_run_blocking,
+            '_image_source': lambda kind='wife': 'gallery',
             '_role_mode': lambda mode: mode,
             '_role_map_title': lambda mode: '老婆',
             '_load_mode_role_map': lambda mode: dict(role_map),
@@ -145,7 +190,11 @@ class NormalWifeFeatureTests(unittest.IsolatedAsyncioTestCase):
             '_merge_role_candidates': lambda base, extra: base,
             '_normalize_role_name': lambda name: name,
         }
-        load_uncached = _extract_function(SHARED_PATH, '_load_wuwa_candidates_uncached', globals_dict)
+        load_uncached = _extract_function(
+            _module_defining('_load_wuwa_candidates_uncached'),
+            '_load_wuwa_candidates_uncached',
+            globals_dict,
+        )
         candidates, err = await load_uncached('wife')
         self.assertIsNone(err)
         self.assertIsNotNone(candidates)
