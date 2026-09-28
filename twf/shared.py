@@ -1557,17 +1557,95 @@ async def _resolve_member_candidate_avatar(member: MemberCandidate) -> MemberCan
     return MemberCandidate(member.name, member.user_id, avatar)
 
 
+# ===== 群友认领登记：同一天同一个群内，一个群友只能被一个人娶到 =====
+_member_claim_lock = asyncio.Lock()
+
+
+def _member_claim_path() -> Path:
+    return _custom_upload_data_root() / 'member_claims.json'
+
+
+def _member_claim_scope(ev: Event) -> str:
+    bot_id = str(getattr(ev, 'real_bot_id', '') or ev.bot_id or '')
+    return f'{bot_id}:{ev.group_id}'
+
+
+def _load_member_claims() -> dict[str, dict[str, str]]:
+    """读取当天的认领表；跨天自动作废。"""
+    path = _member_claim_path()
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError) as exc:
+        logger.warning(f'{LOG_PREFIX} 读取群友认领表失败, 按空表处理: {exc}')
+        return {}
+    if not isinstance(raw, dict) or raw.get('day') != _today_key():
+        return {}
+    claims = raw.get('claims')
+    return claims if isinstance(claims, dict) else {}
+
+
+def _write_member_claims(claims: dict[str, dict[str, str]]) -> None:
+    path = _member_claim_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {'day': _today_key(), 'claims': claims}
+        tmp = path.with_suffix('.json.tmp')
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
+        tmp.replace(path)
+    except OSError as exc:
+        logger.warning(f'{LOG_PREFIX} 写入群友认领表失败: {exc}')
+
+
 async def _pick_group_member(ev: Event, rng: random.Random) -> MemberCandidate | None:
     candidates = list(await _load_group_member_candidates(ev))
     if not candidates:
         return None
 
-    rng.shuffle(candidates)
-    for member in candidates:
-        resolved = await _resolve_member_candidate_avatar(member)
-        if resolved is not None:
+    # 候选名单按群缓存、全群共用，因此在这里按次过滤发起人，避免娶到自己
+    self_id = str(getattr(ev, 'user_id', '') or '').strip()
+    if self_id:
+        candidates = [item for item in candidates if item.user_id != self_id]
+    if not candidates:
+        logger.debug(f'{LOG_PREFIX} 排除发起人后没有其他群友候选')
+        return None
+
+    by_id = {item.user_id: item for item in candidates}
+    scope = _member_claim_scope(ev)
+
+    async with _member_claim_lock:
+        claims = _load_member_claims()
+        scoped = dict(claims.get(scope, {}))
+
+        # 本人当天已认领过，直接沿用，保证重复触发结果稳定
+        mine = scoped.get(self_id)
+        if mine and mine in by_id:
+            resolved = await _resolve_member_candidate_avatar(by_id[mine])
+            if resolved is not None:
+                logger.debug(f'{LOG_PREFIX} 沿用已认领的群友: {resolved.name} ({resolved.user_id})')
+                return resolved
+            logger.debug(f'{LOG_PREFIX} 已认领群友 {mine} 头像不可用, 重新挑选')
+            scoped.pop(self_id, None)
+
+        taken = {tid for owner, tid in scoped.items() if owner != self_id}
+        pool = [item for item in candidates if item.user_id not in taken]
+        if not pool:
+            logger.debug(f'{LOG_PREFIX} 本群today可娶的群友已被认领完')
+            return None
+
+        rng.shuffle(pool)
+        for member in pool:
+            resolved = await _resolve_member_candidate_avatar(member)
+            if resolved is None:
+                continue
+            if self_id:
+                scoped[self_id] = resolved.user_id
+                claims[scope] = scoped
+                _write_member_claims(claims)
             logger.debug(f'{LOG_PREFIX} 成功挑选群友: {resolved.name} ({resolved.user_id})')
             return resolved
+
     logger.warning(f'{LOG_PREFIX} 未能成功获取任一群友的有效头像')
     return None
 
