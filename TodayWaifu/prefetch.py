@@ -29,6 +29,7 @@ from .constants import (
     _image_source,
 )
 from .file_cache import read_url_cache
+from .paths import _reset_now
 
 
 async def _prefetch_once() -> dict[str, int]:
@@ -110,7 +111,8 @@ def seconds_until_prefetch(now: datetime | None = None) -> float:
 
     已过当晚预热时刻但仍在预热窗口内时返回一个很小的值，让刚启动的进程立刻补跑。
     """
-    current = now or datetime.now()
+    # 预热是为「次日零点翻页」准备缓存，必须和 _today_key 同一个时区口径
+    current = now or _reset_now()
     target = current.replace(hour=PREFETCH_HOUR, minute=PREFETCH_MINUTE, second=0, microsecond=0)
     if current < target:
         return (target - current).total_seconds()
@@ -147,7 +149,7 @@ async def _prefetch_loop() -> None:
         delay = seconds_until_prefetch()
         if delay <= 1.0:
             # 本日窗口内已补跑，直接等待下一日，避免每秒重复全量预热。
-            next_day = datetime.now() + timedelta(days=1)
+            next_day = _reset_now() + timedelta(days=1)
             next_day = next_day.replace(hour=0, minute=0, second=0, microsecond=0)
             delay = seconds_until_prefetch(next_day)
         logger.debug(f'{LOG_PREFIX} 下次图库预热将在 {delay / 60:.1f} 分钟后开始')

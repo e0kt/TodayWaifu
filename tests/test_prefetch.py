@@ -25,6 +25,8 @@ def _extract_scheduler() -> Any:
         'timedelta': __import__('datetime').timedelta,
         'PREFETCH_HOUR': 23,
         'PREFETCH_MINUTE': 50,
+        # 用例都显式传 now，所以实际走不到它；提供一个避免将来漏传时 NameError
+        '_reset_now': lambda: datetime(2026, 9, 24, 20, 0, 0),
     }
     exec(compile(module, str(PREFETCH), 'exec'), globals_dict)
     return globals_dict['seconds_until_prefetch']
@@ -126,7 +128,9 @@ class PrefetchBoundednessTests(unittest.TestCase):
         source = PREFETCH.read_text(encoding='utf-8')
         loop = source[source.index('async def _prefetch_loop(') :]
         self.assertIn('if delay <= 1.0:', loop)
-        self.assertIn('next_day = datetime.now() + timedelta(days=1)', loop)
+        # 时间源是 _reset_now()（北京时间）而不是 datetime.now()：预热要和
+        # _today_key 的翻页时刻同一口径，否则两者在非 UTC+8 的机器上错开。
+        self.assertIn('next_day = _reset_now() + timedelta(days=1)', loop)
 
     def test_startup_delay_is_small_but_not_zero(self) -> None:
         values = self._constants()

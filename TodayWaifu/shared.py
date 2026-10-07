@@ -37,6 +37,7 @@ from gsuid_core.utils.database.models import CoreUser
 from .paths import (
     _user_key,
     _daily_rng,
+    _today_date,
     _event_rng,
     _today_key,
     _context_key,
@@ -446,7 +447,7 @@ async def _prune_old_daily_records() -> None:
     retention_days = _record_retention_days()
     if retention_days <= 0:
         return
-    cutoff = (date.today() - timedelta(days=retention_days)).isoformat()
+    cutoff = (_today_date() - timedelta(days=retention_days)).isoformat()
     try:
         removed = await DailyWifeRecord.delete_before(cutoff)
     except SQLAlchemyError as exc:

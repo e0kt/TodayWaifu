@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import random
 from pathlib import Path
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from importlib.util import find_spec
 
 import gsuid_core
@@ -237,10 +237,28 @@ def _gallery_image_cache_root() -> Path:
     return _custom_upload_data_root() / 'gallery_image_cache'
 
 
+# 每日重置固定按北京时间 (UTC+8)，不跟随进程所在时区。
+# 本机与 NAS 都在 PDT(-0700)，date.today() 会让「今日」在北京时间上午 15 点翻页，
+# 既和帮助文案写的「北京时间 0 点」不符，也和 TodayImage 的 TodayImageResetUtcOffset
+# (默认 8) 差出 15 小时 —— 两个「今日」插件在同一个群里会各自按不同的日子重置。
+RESET_UTC_OFFSET_HOURS = 8
+RESET_TZ = timezone(timedelta(hours=RESET_UTC_OFFSET_HOURS))
+
+
+def _reset_now() -> datetime:
+    """当前时刻，带北京时区。给要算到下一个零点/预热点的调度用。"""
+    return datetime.now(RESET_TZ)
+
+
+def _today_date() -> date:
+    """「今天」—— 按北京时间，而不是进程所在时区。"""
+    return _reset_now().date()
+
+
 def _daily_rng(ev: Event, user_id: str | int | None = None, salt: str = '') -> random.Random:
     group_key = ev.group_id or 'direct'
     target_user_id = ev.user_id if user_id is None else user_id
-    seed = f'{date.today().isoformat()}:{target_user_id}:{group_key}'
+    seed = f'{_today_key()}:{target_user_id}:{group_key}'
     if salt:
         seed = f'{seed}:{salt}'
     logger.debug(f'{LOG_PREFIX} 生成随机数种子: {seed}')
@@ -256,7 +274,7 @@ def _wife_data_path() -> Path:
 
 
 def _today_key() -> str:
-    return date.today().isoformat()
+    return _today_date().isoformat()
 
 
 def _context_key(ev: Event) -> str:
