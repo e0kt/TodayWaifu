@@ -105,6 +105,37 @@ def _record_text(record: WifeRecord, mode: str = 'wife', user_id: str = '') -> s
     return _build_text(record.to_role(), mode, user_id)
 
 
+def _untaken_roles(
+    candidates: tuple[RoleCandidate, ...],
+    context: dict,
+    bucket: str,
+    user_key: str,
+) -> tuple[RoleCandidate, ...]:
+    """去掉本群今天已被其他人持有的角色，同一个角色不会同时归两个人。
+
+    被抢走/送出/离婚的记录已经离手，不算占用；补偿老婆（safe_wives）同样占位。
+    全部被占满时退回全量候选，宁可撞车也不让人抽空。
+    """
+    holders = [context.get(bucket)]
+    if bucket == 'wives':
+        holders.append(context.get('safe_wives'))
+    taken: set[str] = set()
+    for records in holders:
+        if not isinstance(records, dict):
+            continue
+        for owner, raw in records.items():
+            if owner == user_key or not isinstance(raw, dict) or _wife_state(raw) != 'owned':
+                continue
+            name = str(raw.get('name') or '').strip()
+            if name:
+                taken.add(_normalize_role_name(name))
+    pool = tuple(role for role in candidates if _normalize_role_name(role.name) not in taken)
+    if not pool:
+        logger.debug(f'{LOG_PREFIX} 本群今天的角色已被抽完，退回允许重复')
+        return candidates
+    return pool
+
+
 async def _ensure_daily_wife_record(
     ev: Event,
     user_id: str | int | None = None,
@@ -128,26 +159,22 @@ async def _ensure_daily_wife_record(
                 return record
 
     chosen: WifeRecord | None = None
+    candidates: tuple[RoleCandidate, ...] = ()
     if specified_role is not None:
         # 主人指定：跳过群友老婆与随机池，直接锁定指定角色
         chosen = _pick_role_record((specified_role,), random)
     elif mode == 'wife' and not _cfg_bool('DailyWifeNormalEnabled', False):
         chosen = await _roll_group_member_wife(ev, key)
     if chosen is None and specified_role is None:
-        rng = _daily_rng(ev, key, salt)
-        candidates, error = await _load_candidates(mode)
-        if error or not candidates:
+        loaded, error = await _load_candidates(mode)
+        if error or not loaded:
             logger.error(f'{LOG_PREFIX} 获取候选列表失败: {error or "候选列表为空"}')
             return None
-        candidates = _filter_by_mode(candidates, mode)
+        candidates = _filter_by_mode(loaded, mode)
         if not candidates:
             logger.warning(f'{LOG_PREFIX} 过滤后没有可用的 {mode} 角色')
             return None
-        chosen = _pick_role_record(candidates, rng)
-        if chosen is None:
-            logger.warning(f'{LOG_PREFIX} 没有可用的 {mode} 角色图片')
-            return None
-    if chosen is None:
+    elif chosen is None:
         return None
 
     async with _daily_context_lock(ev):
@@ -161,6 +188,14 @@ async def _ensure_daily_wife_record(
             if existing_record is not None:
                 logger.debug(f'{LOG_PREFIX} 写入前发现已有 {mode} 记录，直接复用: {existing_record.name}')
                 return existing_record
+
+        if chosen is None:
+            # 去重要看到别人刚落库的记录，所以在锁内挑，避免两人同时抽中同一个
+            pool = _untaken_roles(candidates, context, bucket, key)
+            chosen = _pick_role_record(pool, _daily_rng(ev, key, salt))
+            if chosen is None:
+                logger.warning(f'{LOG_PREFIX} 没有可用的 {mode} 角色图片')
+                return None
 
         value = _record_to_dict(chosen, ev, key)
         await _save_daily_record(ev, bucket, key, value)
@@ -402,6 +437,7 @@ async def _send_daily_wife(
                     return await _safe_send(bot, f'没有找到可用的{title}角色。')
                 rng = _daily_rng(ev, user_key, f'{mode}_safe')
                 candidates = _filter_by_mode(candidates, mode)
+                candidates = _untaken_roles(candidates, context, bucket, user_key)
                 safe_wife = _pick_role_record(candidates, rng)
             if safe_wife is None:
                 logger.warning(f'{LOG_PREFIX} 补偿抽取没有可用图片')
